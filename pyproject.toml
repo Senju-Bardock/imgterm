@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imgterm"
+version = "0.1.0"
+description = "Muestra imágenes PNG en la terminal sin dependencias externas"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+imgterm = "imgterm:main"
+
+[tool.setuptools]
+py-modules = ["imgterm"]
