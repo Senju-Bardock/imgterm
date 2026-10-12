@@ -1,18 +1,18 @@
 """
 imgterm.py
 Displays a PNG image in the terminal (Windows, Linux, macOS) using
-ONLY the Python standard library: no pip installation required.
+ONLY the Python standard library: no pip install needed.
 
 Usage as a module:
     from imgterm import show_image
-    show_image("foto.png")                      # relative or absolute path
-    show_image("Senju_Bardock.png", folder="visual")   # looks inside a folder
-    show_image("https://sitio.com/imagen.png")  # also supports URLs
-    show_image("foto.png", max_width=60)        # limit width (in columns)
+    show_image("photo.png")                          # relative or absolute path
+    show_image("Senju_Bardock.png", folder="visual") # look inside a folder
+    show_image("https://example.com/image.png")      # URLs work too
+    show_image("photo.png", max_width=60)            # limit width (in columns)
 
 Usage from the terminal:
-    python imgterm.py foto.png
-    python imgterm.py foto.png --folder visual --width 60
+    python imgterm.py photo.png
+    python imgterm.py photo.png --folder visual --width 60
 """
 
 import argparse
@@ -26,28 +26,34 @@ from pathlib import Path
 
 __all__ = ["show_image", "read_png", "render"]
 
+
+# ---------------------------------------------------------------------------
 # 1. Prepare the terminal (ANSI colors on Windows)
+# ---------------------------------------------------------------------------
 def prepare_terminal():
     if os.name == "nt":
         try:
             import ctypes
 
             kernel32 = ctypes.windll.kernel32
-            handle = kernel32.GetStdHandle(-11)
+            handle = kernel32.GetStdHandle(-11)  # standard output
             mode = ctypes.c_ulong()
             if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
                 # 0x0004 = ENABLE_VIRTUAL_TERMINAL_PROCESSING
                 kernel32.SetConsoleMode(handle, mode.value | 0x0004)
         except Exception:
-            os.system("")
+            os.system("")  # classic trick to enable ANSI
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
 
 
-2. PNG decoder (zlib+struct only)
+# ---------------------------------------------------------------------------
+# 2. PNG decoder (only zlib + struct, both from the standard library)
+# ---------------------------------------------------------------------------
 def _samples(line, width, channels, depth):
+    """Converts a row of bytes into a list of values per channel."""
     total = width * channels
     if depth == 8:
         return line[:total]
@@ -63,7 +69,7 @@ def _samples(line, width, channels, depth):
 
 
 def _decode_png(data):
-    """Returns (width, height, rows) with rows = list of lists of (r, g, b)."""
+    """Returns (width, height, rows) where rows = list of lists of (r, g, b)."""
     if data[:8] != b"\x89PNG\r\n\x1a\n":
         raise ValueError("The file is not a valid PNG.")
 
@@ -84,7 +90,7 @@ def _decode_png(data):
             break
 
     if interlaced:
-        raise ValueError("Interlaced PNG (Adam7) not supported. Save it without interlacing.")
+        raise ValueError("Interlaced PNG (Adam7) is not supported. Save it without interlacing.")
 
     channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color]
     bits_pixel = channels * depth
@@ -135,7 +141,7 @@ def _row_to_rgb(line, width, channels, depth, color, palette):
     scale = 255 // ((1 << depth) - 1) if depth < 8 else 1
     px = []
     for i in range(width):
-        if color == 0:  # grays
+        if color == 0:  # grayscale
             g = s[i] * scale
             px.append((g, g, g))
         elif color == 2:  # RGB
@@ -143,7 +149,7 @@ def _row_to_rgb(line, width, channels, depth, color, palette):
             px.append((s[j], s[j + 1], s[j + 2]))
         elif color == 3:  # palette
             px.append(palette[s[i]])
-        elif color == 4:  # grays + alpha
+        elif color == 4:  # grayscale + alpha
             j = i * 2
             g = s[j] * s[j + 1] // 255
             px.append((g, g, g))
@@ -155,7 +161,7 @@ def _row_to_rgb(line, width, channels, depth, color, palette):
 
 
 def read_png(source):
-    """Lee un PNG desde una ruta o una URL y devuelve (ancho, alto, filas)."""
+    """Reads a PNG from a path or a URL. Returns (width, height, rows)."""
     source = str(source)
     if source.startswith(("http://", "https://")):
         with urllib.request.urlopen(source, timeout=15) as response:
@@ -165,9 +171,11 @@ def read_png(source):
     return _decode_png(data)
 
 
+# ---------------------------------------------------------------------------
 # 3. Resize and draw
+# ---------------------------------------------------------------------------
 def _resize(rows, width, height, new_width, new_height):
-    """Promedia los píxeles de cada zona (se ve mejor que copiar el más cercano)."""
+    """Averages the pixels of each area (looks better than nearest neighbor)."""
     result = []
     for ty in range(new_height):
         y0 = ty * height // new_height
@@ -191,15 +199,15 @@ def _resize(rows, width, height, new_width, new_height):
 
 
 def render(width, height, rows, max_width=None, max_height=None):
-    """Convierte los píxeles en una cadena con códigos ANSI lista para imprimir."""
+    """Turns pixels into a string of ANSI codes, ready to print."""
     columns, lines = shutil.get_terminal_size((80, 24))
     max_w = min(columns, max_width or columns)
-    max_h = max(2, (max_height or (lines - 2)) * 2)  # each line of text = 2 pixels
+    max_h = max(2, (max_height or (lines - 2)) * 2)  # each text line = 2 pixels
 
     scale = min(max_w / width, max_h / height)
     new_width = max(1, int(width * scale))
     new_height = max(2, int(height * scale))
-    new_height -= new_height % 2
+    new_height -= new_height % 2  # must be even
 
     img = _resize(rows, width, height, new_width, new_height)
 
@@ -210,19 +218,19 @@ def render(width, height, rows, max_width=None, max_height=None):
             r1, g1, b1 = img[y][x]
             r2, g2, b2 = img[y + 1][x]
             # "▀" = upper half (text color) + lower half (background color)
-            parts.append(f"\x1b[38;2;{r1};{g1};{b1}m\x1b[48;2;{r2};{g2};{b2}m\u2580")
+            parts.append(f"\x1b[38;2;{r1};{g1};{b1}m\x1b[48;2;{r2};{g2};{b2}m▀")
         out.append("".join(parts) + "\x1b[0m")
     return "\n".join(out)
 
 
 def show_image(path, folder=None, max_width=None, max_height=None):
     """
-    Draw a PNG image in the terminal.
+    Draws a PNG image in the terminal.
 
-path: The path (relative or absolute) or URL of the image.
-folder: The folder to search in if 'path' is relative (optional).
-max_width: The maximum width in columns (optional).
-max_height: The maximum height in lines of text (optional).
+    path        Path (relative or absolute) or URL of the image.
+    folder      Folder to look in if 'path' is relative (optional).
+    max_width   Maximum width in columns (optional).
+    max_height  Maximum height in text lines (optional).
     """
     prepare_terminal()
     path = str(path)
@@ -233,7 +241,7 @@ max_height: The maximum height in lines of text (optional).
         if folder is not None and not target.is_absolute():
             target = Path(folder).expanduser() / target
         if target.suffix.lower() != ".png":
-            print(f"Only PNGs without external libraries can be displayed (received: {target.suffix or 'without extension'}).")
+            print(f"Only PNG files can be displayed without external libraries (received: {target.suffix or 'no extension'}).")
             return
         if not target.exists():
             print(f"Image not found: {target.resolve()}")
@@ -243,18 +251,18 @@ max_height: The maximum height in lines of text (optional).
     try:
         width, height, rows = read_png(path)
     except Exception as error:
-        print(f"The image could not be read.: {error}")
+        print(f"Could not read the image: {error}")
         return
 
     print(render(width, height, rows, max_width, max_height))
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Muestra un PNG en la terminal.")
-    parser.add_argument("image", help="ruta o URL del PNG")
-    parser.add_argument("-f", "--folder", help="carpeta donde buscar la imagen")
-    parser.add_argument("-w", "--width", type=int, help="ancho máximo en columnas")
-    parser.add_argument("-H", "--height", type=int, help="alto máximo en líneas")
+    parser = argparse.ArgumentParser(description="Displays a PNG image in the terminal.")
+    parser.add_argument("image", help="path or URL of the PNG")
+    parser.add_argument("-f", "--folder", help="folder to look for the image in")
+    parser.add_argument("-w", "--width", type=int, help="maximum width in columns")
+    parser.add_argument("-H", "--height", type=int, help="maximum height in text lines")
     args = parser.parse_args(argv)
     show_image(args.image, folder=args.folder, max_width=args.width, max_height=args.height)
 
