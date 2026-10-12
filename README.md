@@ -1,11 +1,11 @@
 # imgterm
 
-Muestra imágenes PNG en la terminal (Windows, Linux, macOS) con **solo la biblioteca estándar de Python**. Sin dependencias.
+Displays PNG images in the terminal (Windows, Linux, macOS) using only the Python standard library. No dependencies.
 
-## Opción 1: instalar directo desde GitHub (una vez)
+## Option 1: Install directly from GitHub (one-time)
 
 ```bash
-pip install git+https://github.com/TU_USUARIO/imgterm.git
+pip install git+https://github.com/Senju-Bardock/imgterm.git
 ```
 
 ```python
@@ -17,33 +17,33 @@ show_image("foto.png", max_width=60)
 show_image("https://sitio.com/imagen.png")
 ```
 
-También queda disponible el comando:
+The following command is also available:
 
 ```bash
 imgterm foto.png --width 60
 ```
 
-## Opción 2: sin instalar ni descargar nada
+## Option 2: without installing or downloading anything
 
-Pega esto al principio de tu script. Descarga el módulo en memoria desde GitHub cada vez que se ejecuta (necesita internet):
+Paste this at the beginning of your script. It downloads the module into memory from GitHub each time it runs (requires an internet connection):
 
 ```python
 import types, urllib.request
 
-URL = "https://raw.githubusercontent.com/TU_USUARIO/imgterm/main/imgterm.py"
+URL = "https://raw.githubusercontent.com/Senju-Bardock/imgterm/main/imgterm.py"
 imgterm = types.ModuleType("imgterm")
 exec(urllib.request.urlopen(URL).read().decode(), imgterm.__dict__)
 
 imgterm.show_image("foto.png")
 ```
 
-Consejo: en lugar de `main` usa una etiqueta o un commit (`.../imgterm/v0.1.0/imgterm.py`) para que el código no cambie sin que lo sepas.
+Tip: Instead of `main`, use a tag or a commit (`.../imgterm/v0.1.0/imgterm.py`) so the code doesn't change without you knowing.
 
-## Opción 3: copiar el archivo
+## Option 3: Copy the file
 
-`imgterm.py` es un único archivo; basta con ponerlo junto a tu proyecto.
+`imgterm.py` is a single file; you simply need to place it alongside your project.
 
-## Limitaciones
+## Limitations
 
-- Solo PNG, y sin entrelazado (Adam7).
-- Necesita una terminal con colores de 24 bits (Windows Terminal, la mayoría de terminales de Linux/macOS).
+- PNG only, and without interlacing (Adam7).
+- Requires a terminal with 24-bit color support (Windows Terminal, most Linux/macOS terminals).
