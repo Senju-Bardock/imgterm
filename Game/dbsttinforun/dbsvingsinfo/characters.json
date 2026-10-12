@@ -1,0 +1,111 @@
+{
+    "characters": [
+        {
+            "Goku": [
+                {
+                    "Description": "A Saiyan originally sent to Earth as a baby with the mission to destroy it. However, after suffering a head injury, he lost his aggressive nature and became one of Earth's greatest defenders."
+                },
+                {
+                    "id": "goku_saiyan_saga",
+                    "name": "Goku",
+                    "race": "Saiyan",
+                    "Saga": "Dragon Ball Z",
+                    "arc": "Saiyan Saga",
+                    "HP": 90,
+                    "Ki": 180,
+                    "Attack": 14,
+                    "Defense": 10,
+                    "Speed": 15,
+                    "Special": 11,
+                    "Magic": 4,
+                    "passive_skill": "Zenkai",
+                    "special_skills": [
+                        "Kamehameha",
+                        "Kaioken",
+                        "Solar Flare",
+                        "Meteor Combination"
+                    ],
+                    "ultimate_skills": [
+                        "Spirit Bomb",
+                        "Super Kamehameha"
+                    ],
+                    "transformations": [
+                    null,
+                    null,
+                    null,
+                    null
+                    ],
+                    "items": [
+                        null
+                    ],
+                    "resources": {
+                        "satan_medals": 0,
+                        "katchin_fragments": 0,
+                        "stardust": 0
+                    }
+                },
+                {
+                    "id": "goku_namek_saga",
+                    "name": "Goku",
+                    "race": "Saiyan",
+                    "Saga": "Dragon Ball Z",
+                    "arc": "Namek Saga",
+                    "HP": 10,
+                    "Ki": 150,
+                    "Attack": 12,
+                    "Defense": 10,
+                    "Speed": 16,
+                    "Special": 15,
+                    "Magic": 7,
+                    "passive_skill": "Zenkai",
+                    "special_skills": [
+                        "Kamehameha",
+                        "Kaioken",
+                        "Please, give me your energy!",
+                        "Meteor Smash"
+                    ],
+                    "ultimate_skills": [
+                        "Super Spirit Bomb",
+                        "Angry Kamehameha"
+                    ],
+                    "transformations": [
+                        "Super Saiyan"
+                    ]
+                }
+            ],
+            "Vegeta": [     
+                {
+                    "Description": "The prince of the Saiyan race, Vegeta is a proud and powerful warrior who initially comes to Earth seeking the Dragon Balls for immortality until ending up as a hero and a defender. He is known for his rivalry with Goku and his relentless pursuit of strength."
+                },      
+                {
+                    "id": "vegeta_saiyan_saga",
+                    "name": "Vegeta",
+                    "race": "Saiyan",
+                    "Saga": "Dragon Ball Z",
+                    "arc": "Saiyan Saga",
+                    "HP": 85,
+                    "Ki": 95,
+                    "Attack": 10,
+                    "Defense": 11,
+                    "Speed": 14,
+                    "Special": 16,
+                    "Magic": 3,
+                    "passive_skill": "Zenkai",
+                    "special_skills": [
+                        "Galick Gun",
+                        "Full Power Energy Blast Volley",
+                        "Final Impact",
+                        "Artificial Moon"
+                    ],
+                    "ultimate_skills": [
+                        "Dirty Fireworks",
+                        "Super Galick Gun"
+                    ],
+                    "transformations": [
+                            "Great Ape"
+                    ]
+                }
+            ]
+        }
+    ]
+}
