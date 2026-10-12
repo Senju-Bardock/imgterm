@@ -1,16 +1,16 @@
 """
 imgterm.py
-Muestra una imagen PNG en la terminal (Windows, Linux, macOS) usando
-SOLO la biblioteca estándar de Python: no hace falta pip install de nada.
+Displays a PNG image in the terminal (Windows, Linux, macOS) using
+ONLY the Python standard library: no pip installation required.
 
-Uso como módulo:
+Usage as a module:
     from imgterm import show_image
-    show_image("foto.png")                      # ruta relativa o absoluta
-    show_image("Senju_Bardock.png", folder="visual")   # busca dentro de una carpeta
-    show_image("https://sitio.com/imagen.png")  # también admite URLs
-    show_image("foto.png", max_width=60)        # limitar el ancho (en columnas)
+    show_image("foto.png")                      # relative or absolute path
+    show_image("Senju_Bardock.png", folder="visual")   # looks inside a folder
+    show_image("https://sitio.com/imagen.png")  # also supports URLs
+    show_image("foto.png", max_width=60)        # limit width (in columns)
 
-Uso desde la terminal:
+Usage from the terminal:
     python imgterm.py foto.png
     python imgterm.py foto.png --folder visual --width 60
 """
@@ -26,10 +26,7 @@ from pathlib import Path
 
 __all__ = ["show_image", "read_png", "render"]
 
-
-# ---------------------------------------------------------------------------
-# 1. Preparar la terminal (colores ANSI en Windows)
-# ---------------------------------------------------------------------------
+# 1. Prepare the terminal (ANSI colors on Windows)
 def prepare_terminal():
     if os.name == "nt":
         try:
@@ -49,15 +46,13 @@ def prepare_terminal():
         pass
 
 
-# ---------------------------------------------------------------------------
-# 2. Decodificador PNG (solo zlib + struct)
-# ---------------------------------------------------------------------------
+2. PNG decoder (zlib+struct only)
 def _samples(line, width, channels, depth):
     total = width * channels
     if depth == 8:
         return line[:total]
     if depth == 16:
-        return line[0:total * 2:2]  # nos quedamos con el byte alto
+        return line[0:total * 2:2]  # keep the high byte
     mask = (1 << depth) - 1
     per_byte = 8 // depth
     output = []
@@ -68,9 +63,9 @@ def _samples(line, width, channels, depth):
 
 
 def _decode_png(data):
-    """Devuelve (ancho, alto, filas) con filas = lista de listas de (r, g, b)."""
+    """Returns (width, height, rows) with rows = list of lists of (r, g, b)."""
     if data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise ValueError("El archivo no es un PNG válido.")
+        raise ValueError("The file is not a valid PNG.")
 
     pos = 8
     idat = bytearray()
@@ -89,7 +84,7 @@ def _decode_png(data):
             break
 
     if interlaced:
-        raise ValueError("PNG entrelazado (Adam7) no soportado. Guárdalo sin entrelazado.")
+        raise ValueError("Interlaced PNG (Adam7) not supported. Save it without interlacing.")
 
     channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color]
     bits_pixel = channels * depth
@@ -140,19 +135,19 @@ def _row_to_rgb(line, width, channels, depth, color, palette):
     scale = 255 // ((1 << depth) - 1) if depth < 8 else 1
     px = []
     for i in range(width):
-        if color == 0:  # grises
+        if color == 0:  # grays
             g = s[i] * scale
             px.append((g, g, g))
         elif color == 2:  # RGB
             j = i * 3
             px.append((s[j], s[j + 1], s[j + 2]))
-        elif color == 3:  # paleta
+        elif color == 3:  # palette
             px.append(palette[s[i]])
-        elif color == 4:  # grises + alfa
+        elif color == 4:  # grays + alpha
             j = i * 2
             g = s[j] * s[j + 1] // 255
             px.append((g, g, g))
-        else:  # RGBA (mezclado con fondo negro)
+        else:  # RGBA (blended with a black background)
             j = i * 4
             a = s[j + 3]
             px.append((s[j] * a // 255, s[j + 1] * a // 255, s[j + 2] * a // 255))
@@ -170,9 +165,7 @@ def read_png(source):
     return _decode_png(data)
 
 
-# ---------------------------------------------------------------------------
-# 3. Redimensionar y dibujar
-# ---------------------------------------------------------------------------
+# 3. Resize and draw
 def _resize(rows, width, height, new_width, new_height):
     """Promedia los píxeles de cada zona (se ve mejor que copiar el más cercano)."""
     result = []
@@ -201,7 +194,7 @@ def render(width, height, rows, max_width=None, max_height=None):
     """Convierte los píxeles en una cadena con códigos ANSI lista para imprimir."""
     columns, lines = shutil.get_terminal_size((80, 24))
     max_w = min(columns, max_width or columns)
-    max_h = max(2, (max_height or (lines - 2)) * 2)  # cada línea de texto = 2 píxeles
+    max_h = max(2, (max_height or (lines - 2)) * 2)  # each line of text = 2 pixels
 
     scale = min(max_w / width, max_h / height)
     new_width = max(1, int(width * scale))
@@ -216,7 +209,7 @@ def render(width, height, rows, max_width=None, max_height=None):
         for x in range(new_width):
             r1, g1, b1 = img[y][x]
             r2, g2, b2 = img[y + 1][x]
-            # "▀" = mitad superior (color de texto) + inferior (color de fondo)
+            # "▀" = upper half (text color) + lower half (background color)
             parts.append(f"\x1b[38;2;{r1};{g1};{b1}m\x1b[48;2;{r2};{g2};{b2}m\u2580")
         out.append("".join(parts) + "\x1b[0m")
     return "\n".join(out)
@@ -224,12 +217,12 @@ def render(width, height, rows, max_width=None, max_height=None):
 
 def show_image(path, folder=None, max_width=None, max_height=None):
     """
-    Dibuja una imagen PNG en la terminal.
+    Draw a PNG image in the terminal.
 
-    path       Ruta (relativa o absoluta) o URL de la imagen.
-    folder     Carpeta donde buscar si 'path' es relativa (opcional).
-    max_width  Ancho máximo en columnas (opcional).
-    max_height Alto máximo en líneas de texto (opcional).
+path: The path (relative or absolute) or URL of the image.
+folder: The folder to search in if 'path' is relative (optional).
+max_width: The maximum width in columns (optional).
+max_height: The maximum height in lines of text (optional).
     """
     prepare_terminal()
     path = str(path)
@@ -240,17 +233,17 @@ def show_image(path, folder=None, max_width=None, max_height=None):
         if folder is not None and not target.is_absolute():
             target = Path(folder).expanduser() / target
         if target.suffix.lower() != ".png":
-            print(f"Solo se pueden mostrar PNG sin librerías externas (recibido: {target.suffix or 'sin extensión'}).")
+            print(f"Only PNGs without external libraries can be displayed (received: {target.suffix or 'without extension'}).")
             return
         if not target.exists():
-            print(f"Imagen no encontrada: {target.resolve()}")
+            print(f"Image not found: {target.resolve()}")
             return
         path = target
 
     try:
         width, height, rows = read_png(path)
     except Exception as error:
-        print(f"No se pudo leer la imagen: {error}")
+        print(f"The image could not be read.: {error}")
         return
 
     print(render(width, height, rows, max_width, max_height))
