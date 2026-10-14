@@ -81,8 +81,8 @@ _CELL = re.compile(r"\x1b\[6;(\d+);(\d+)t")
 def _query_terminal(timeout=0.5):
     """
     Ask the terminal two things in one go:
-      CSI 16 t -> size of a character cell in pixels
-      CSI c    -> device attributes (the list contains 4 when sixel is supported)
+        CSI 16 t -> size of a character cell in pixels
+        CSI c    -> device attributes (the list contains 4 when sixel is supported)
     Returns (supports_sixel, (cell_w, cell_h) or None).
     """
     try:
@@ -201,8 +201,7 @@ def _truecolor():
 # ---------------------------------------------------------------------------
 # 2. PNG decoder (zlib + struct only): all color types, 1-16 bit, tRNS, Adam7
 # ---------------------------------------------------------------------------
-_ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
-          (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+_ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
 
 
 def _samples(line, width, channels, depth):
@@ -434,7 +433,7 @@ def read_png(source, background=(0, 0, 0)):
 # 3. Resizing: area averaging (shrink) / bilinear (enlarge) in LINEAR light
 # ---------------------------------------------------------------------------
 _TO_LINEAR = [(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4)
-              for c in (i / 255 for i in range(256))]
+                for c in (i / 255 for i in range(256))]
 _N_LIN = 4096
 _FROM_LINEAR = [round(255 * (12.92 * v if v <= 0.0031308 else 1.055 * v ** (1 / 2.4) - 0.055))
                 for v in (i / (_N_LIN - 1) for i in range(_N_LIN))]
@@ -509,7 +508,7 @@ def _resize(rows, width, height, new_w, new_h):
         result.append([(f[min(top, int(r * top + 0.5))],
                         f[min(top, int(g * top + 0.5))],
                         f[min(top, int(b * top + 0.5))])
-                       for r, g, b in zip(resized[0][y], resized[1][y], resized[2][y])])
+                        for r, g, b in zip(resized[0][y], resized[1][y], resized[2][y])])
     return result
 
 
@@ -524,10 +523,10 @@ def _fit(width, height, box_w, box_h):
 # bit 0 = upper-left, 1 = upper-right, 2 = lower-left, 3 = lower-right
 _PARTS = []
 for _mask, _glyph in ((0, " "), (1, "\u2598"), (2, "\u259d"), (4, "\u2596"), (8, "\u2597"),
-                      (3, "\u2580"), (5, "\u258c"), (6, "\u259e")):
+                        (3, "\u2580"), (5, "\u258c"), (6, "\u259e")):
     _PARTS.append((_glyph,
-                   [i for i in range(4) if _mask >> i & 1],
-                   [i for i in range(4) if not _mask >> i & 1]))
+                    [i for i in range(4) if _mask >> i & 1],
+                    [i for i in range(4) if not _mask >> i & 1]))
 
 
 def _group(px, ids):
@@ -667,7 +666,7 @@ def _quantize(img, colors=256):
             lookup[item[0]] = index
 
     idx = [[lookup[((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2)] for r, g, b in row]
-           for row in img]
+            for row in img]
     return palette, idx
 
 
@@ -741,8 +740,7 @@ def _render_iterm2(png, cols):
 # ---------------------------------------------------------------------------
 # 5. Public API
 # ---------------------------------------------------------------------------
-def render(width, height, rows, max_width=None, max_height=None, mode="auto", cell=None,
-           _term_size=None):
+def render(width, height, rows, max_width=None, max_height=None, mode="auto", cell=None, _term_size=None):
     """Turn decoded pixels into a string ready to print with the chosen renderer."""
     caps = _terminal_caps()
     if mode in (None, "auto"):
@@ -797,7 +795,7 @@ def _resolve(path, folder):
         target = Path(folder).expanduser() / target
     if target.suffix.lower() != ".png":
         return None, (f"Only PNGs can be displayed without external libraries "
-                      f"(received: {target.suffix or 'no extension'}).")
+                        f"(received: {target.suffix or 'no extension'}).")
     if not target.exists():
         return None, f"Image not found: {target.resolve()}"
     return target, None
@@ -844,8 +842,7 @@ def _cached_output(key, source, max_width, max_height, mode, background, cell, s
             event.set()
 
 
-def show_image(path, folder=None, max_width=None, max_height=None,
-               mode="auto", background=(0, 0, 0), cell=None):
+def show_image(path, folder=None, max_width=None, max_height=None, mode="auto", background=(0, 0, 0), cell=None):
     """
     Draw a PNG image in the terminal.
 
@@ -877,8 +874,7 @@ def show_image(path, folder=None, max_width=None, max_height=None,
     sys.stdout.flush()
 
 
-def preload(path, folder=None, max_width=None, max_height=None,
-            mode="auto", background=(0, 0, 0), cell=None, threaded=True):
+def preload(path, folder=None, max_width=None, max_height=None, mode="auto", background=(0, 0, 0), cell=None, threaded=True):
     """
     Decode and render an image ahead of time so the first show_image() is instant.
 
@@ -937,7 +933,7 @@ def main(argv=None):
             parser.error("--cell must look like 10x20")
         cell = (int(m.group(1)), int(m.group(2)))
     show_image(args.image, folder=args.folder, max_width=args.width, max_height=args.height,
-               mode=args.mode, background=_parse_color(args.bg), cell=cell)
+                mode=args.mode, background=_parse_color(args.bg), cell=cell)
 
 
 if __name__ == "__main__":
