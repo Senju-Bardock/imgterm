@@ -45,7 +45,7 @@ Tip: use a tag or a commit instead of `main` (`.../imgterm/v0.1.0/imgterm.py`) s
 
 ## Speed: caching and preload
 
-Decoding a PNG in pure Python takes a moment (roughly proportional to the number of pixels). `imgterm` keeps every rendered image in memory, so **showing the same image again is practically instant**. The first time can be hidden by decoding in the background at startup:
+Decoding a PNG in pure Python takes a moment (roughly proportional to the number of pixels). `imgterm` keeps every rendered image in memory, so **showing the same image again is practically instant** (about 0.2 ms, identical output). The first time can be hidden by decoding in the background at startup:
 
 ```python
 from imgterm import show_image, preload
@@ -56,7 +56,7 @@ preload("Senju_Bardock.png", folder="visual", max_width=40)  # returns immediate
 show_image("Senju_Bardock.png", folder="visual", max_width=40)  # instant
 ```
 
-Use the same `folder`, `max_width` and `max_height` in both calls. The cache is refreshed automatically if the file changes or the terminal is resized. Tip: images much bigger than what is shown (e.g. 2000 px wide for a 40-column display) only slow down the first decode; a smaller PNG looks the same.
+Use the same `folder`, `max_width`, `max_height` (and `mode`, if you set it) in both calls. If `show_image` is called while the preload is still running, it simply waits for it instead of repeating the work. The cache is refreshed automatically if the file changes or the terminal is resized. The decoder and the resizer are also about 1.5-2x faster than in 0.2.0, with pixel-identical output. Tip: images much bigger than what is shown (e.g. 2000 px wide for a 40-column display) only slow down the first decode; a smaller PNG looks the same.
 
 ## Example
 
@@ -72,11 +72,11 @@ python example.py path/to/your_image.png
 | Function | Description |
 | --- | --- |
 | `show_image(path, folder=None, max_width=None, max_height=None)` | Draws a PNG (path or URL) in the terminal |
-| `preload(path, folder=None, max_width=None, max_height=None, background=True)` | Decodes and renders ahead of time (in a background thread) so the first `show_image` is instant |
+| `preload(path, folder=None, max_width=None, max_height=None, mode="auto", threaded=True)` | Decodes and renders ahead of time (in a background thread) so the first `show_image` is instant |
 | `read_png(source)` | Decodes a PNG and returns `(width, height, rows)` |
 | `render(width, height, rows, max_width=None, max_height=None)` | Returns the ANSI string, ready to print |
 
 ## Limitations
 
-- PNG only, and not interlaced (Adam7).
-- Needs a terminal with 24-bit color (Windows Terminal and most Linux/macOS terminals).
+- PNG only (all color types, 1-16 bit, tRNS and Adam7 interlacing are supported).
+- The `blocks` fallback needs a terminal with 24-bit color (set `IMGTERM_COLORS=256` otherwise).

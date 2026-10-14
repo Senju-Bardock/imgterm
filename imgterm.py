@@ -37,13 +37,15 @@ import re
 import shutil
 import struct
 import sys
+import threading
 import time
 import urllib.request
 import zlib
-from itertools import chain, groupby
+from functools import lru_cache
+from itertools import accumulate, chain, groupby
 from pathlib import Path
 
-__all__ = ["show_image", "read_png", "render", "detect_mode"]
+__all__ = ["show_image", "preload", "read_png", "render", "detect_mode"]
 
 MODES = ("auto", "sixel", "kitty", "iterm2", "blocks")
 DEFAULT_CELL = (9, 18)  # pixels (width, height) of a character cell if unknown
@@ -222,6 +224,7 @@ def _unfilter(raw, pos, width, height, bits_pixel):
     """Undo the PNG scanline filters of one (sub)image. Returns (rows, new_pos)."""
     bpp = max(1, bits_pixel // 8)
     stride = (width * bits_pixel + 7) // 8
+    channels = range(min(bpp, stride))
     rows = []
     previous = bytearray(stride)
     for _ in range(height):
@@ -229,29 +232,44 @@ def _unfilter(raw, pos, width, height, bits_pixel):
         line = bytearray(raw[pos + 1:pos + 1 + stride])
         pos += 1 + stride
 
-        if filter_type == 1:  # Sub
-            for i in range(bpp, stride):
-                line[i] = (line[i] + line[i - bpp]) & 255
+        if filter_type == 1:  # Sub: running sum along each channel
+            for c in channels:
+                line[c::bpp] = bytes([v & 255 for v in accumulate(line[c::bpp])])
         elif filter_type == 2:  # Up
-            for i in range(stride):
-                line[i] = (line[i] + previous[i]) & 255
+            line = bytearray([(x + y) & 255 for x, y in zip(line, previous)])
         elif filter_type == 3:  # Average
-            for i in range(stride):
-                left = line[i - bpp] if i >= bpp else 0
-                line[i] = (line[i] + ((left + previous[i]) >> 1)) & 255
+            for c in channels:
+                left = 0
+                out = []
+                for x, b in zip(line[c::bpp], previous[c::bpp]):
+                    left = (x + ((left + b) >> 1)) & 255
+                    out.append(left)
+                line[c::bpp] = bytes(out)
         elif filter_type == 4:  # Paeth
-            for i in range(stride):
-                a = line[i - bpp] if i >= bpp else 0
-                b = previous[i]
-                c = previous[i - bpp] if i >= bpp else 0
-                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
-                if pa <= pb and pa <= pc:
-                    pr = a
-                elif pb <= pc:
-                    pr = b
-                else:
-                    pr = c
-                line[i] = (line[i] + pr) & 255
+            for c in channels:
+                a = cc = 0
+                out = []
+                for x, b in zip(line[c::bpp], previous[c::bpp]):
+                    p = a + b - cc
+                    pa = p - a
+                    pb = p - b
+                    pc = p - cc
+                    if pa < 0:
+                        pa = -pa
+                    if pb < 0:
+                        pb = -pb
+                    if pc < 0:
+                        pc = -pc
+                    if pa <= pb and pa <= pc:
+                        pr = a
+                    elif pb <= pc:
+                        pr = b
+                    else:
+                        pr = cc
+                    a = (x + pr) & 255
+                    out.append(a)
+                    cc = b
+                line[c::bpp] = bytes(out)
 
         rows.append(line)
         previous = line
@@ -263,6 +281,35 @@ def _row_to_rgb(line, width, channels, depth, color, palette, trns, bg):
     s = _samples(line, width, channels, depth)
     scale = 255 // ((1 << depth) - 1) if depth < 8 else 1
     br, bgg, bb = bg
+
+    # Fast paths (vectorised with slices/zip); exactly the same maths as the
+    # generic loop below. For palette images 'palette' is already blended.
+    if trns is None:
+        if color == 6:  # RGBA
+            r, g, b, a = s[0::4], s[1::4], s[2::4], s[3::4]
+            if min(a) == 255:
+                return list(zip(r, g, b))
+            return [(r_, g_, b_) if a_ == 255 else
+                    ((r_ * a_ + br * (255 - a_)) // 255,
+                     (g_ * a_ + bgg * (255 - a_)) // 255,
+                     (b_ * a_ + bb * (255 - a_)) // 255)
+                    for r_, g_, b_, a_ in zip(r, g, b, a)]
+        if color == 2:  # RGB
+            return list(zip(s[0::3], s[1::3], s[2::3]))
+        if color == 3:  # palette
+            return [palette[i] for i in s]
+        if color == 0:  # gray
+            if scale == 1:
+                return [(v, v, v) for v in s]
+            return [(v * scale,) * 3 for v in s]
+        if color == 4:  # gray + alpha
+            g, a = s[0::2], s[1::2]
+            return [(v, v, v) if a_ == 255 else
+                    (((v * a_ + br * (255 - a_)) // 255),
+                     ((v * a_ + bgg * (255 - a_)) // 255),
+                     ((v * a_ + bb * (255 - a_)) // 255))
+                    for v, a_ in zip(g, a)]
+
     px = []
     for i in range(width):
         a = 255
@@ -334,6 +381,19 @@ def _decode_png(data, background=(0, 0, 0)):
             vals = struct.unpack(">3H", trns_raw[:6])
             trns = tuple(v >> 8 for v in vals) if depth == 16 else vals
 
+    if color == 3 and palette is not None:
+        # blend transparency into the palette once instead of once per pixel
+        br, bgg, bb = background
+        blended = []
+        for n, (r, g, b) in enumerate(palette):
+            a = trns[n] if trns is not None and n < len(trns) else 255
+            if a != 255:
+                r = (r * a + br * (255 - a)) // 255
+                g = (g * a + bgg * (255 - a)) // 255
+                b = (b * a + bb * (255 - a)) // 255
+            blended.append((r, g, b))
+        palette, trns = blended, None
+
     raw = zlib.decompress(bytes(idat))
 
     if not interlaced:
@@ -404,36 +464,43 @@ def _weights(src_n, dst_n):
     return out
 
 
+def _mix(vectors, taps_list):
+    """Weighted sum of whole vectors: one output vector per entry of taps_list."""
+    out = []
+    for taps in taps_list:
+        if len(taps) == 1:
+            i, w = taps[0]
+            out.append(vectors[i] if w == 1.0 else [w * v for v in vectors[i]])
+            continue
+        i, w = taps[0]
+        acc = [w * v for v in vectors[i]]
+        for i, w in taps[1:]:
+            acc = [a + w * v for a, v in zip(acc, vectors[i])]
+        out.append(acc)
+    return out
+
+
 def _resize(rows, width, height, new_w, new_h):
     if (new_w, new_h) == (width, height):
         return rows
     wy = _weights(height, new_h)
     wx = _weights(width, new_w)
-    fast = None
-    if max(len(t) for t in wx) <= 2:
-        fast = [(t[0][0], t[0][1], t[-1][0], t[1][1] if len(t) > 1 else 0.0) for t in wx]
 
-    planes = []
-    for c in range(3):
-        lin = _TO_LINEAR
-        plane = [[lin[p[c]] for p in row] for row in rows]
-        # vertical pass (whole rows at a time)
-        vert = []
-        for taps in wy:
-            if len(taps) == 1:
-                vert.append(plane[taps[0][0]])
-                continue
-            acc = None
-            for i, w in taps:
-                r = plane[i]
-                acc = [w * v for v in r] if acc is None else [a + w * v for a, v in zip(acc, r)]
-            vert.append(acc)
-        del plane
-        # horizontal pass
-        if fast is not None:
-            planes.append([[a[i0] * w0 + a[i1] * w1 for i0, w0, i1, w1 in fast] for a in vert])
-        else:
-            planes.append([[sum(a[i] * w for i, w in t) for t in wx] for a in vert])
+    # sRGB -> linear light, one list of floats per channel and row
+    get = _TO_LINEAR.__getitem__
+    planes = ([], [], [])
+    for row in rows:
+        r, g, b = zip(*row)
+        planes[0].append(list(map(get, r)))
+        planes[1].append(list(map(get, g)))
+        planes[2].append(list(map(get, b)))
+
+    resized = []
+    for plane in planes:
+        vert = _mix(plane, wy)                    # new_h rows x width
+        cols = _mix(list(zip(*vert)), wx)         # new_w columns x new_h (transposed trick)
+        resized.append(list(zip(*cols)))          # back to new_h rows x new_w
+        del plane[:], vert, cols
 
     top = _N_LIN - 1
     f = _FROM_LINEAR
@@ -442,7 +509,7 @@ def _resize(rows, width, height, new_w, new_h):
         result.append([(f[min(top, int(r * top + 0.5))],
                         f[min(top, int(g * top + 0.5))],
                         f[min(top, int(b * top + 0.5))])
-                       for r, g, b in zip(planes[0][y], planes[1][y], planes[2][y])])
+                       for r, g, b in zip(resized[0][y], resized[1][y], resized[2][y])])
     return result
 
 
@@ -476,6 +543,7 @@ def _group(px, ids):
     return mean, sq - (sr * sr + sg * sg + sb * sb) / n
 
 
+@lru_cache(maxsize=1 << 16)
 def _best_cell(px):
     """Pick the glyph + (fg, bg) colors that best reproduce 4 sub-pixels."""
     if px[0] == px[1] == px[2] == px[3]:
@@ -673,7 +741,8 @@ def _render_iterm2(png, cols):
 # ---------------------------------------------------------------------------
 # 5. Public API
 # ---------------------------------------------------------------------------
-def render(width, height, rows, max_width=None, max_height=None, mode="auto", cell=None):
+def render(width, height, rows, max_width=None, max_height=None, mode="auto", cell=None,
+           _term_size=None):
     """Turn decoded pixels into a string ready to print with the chosen renderer."""
     caps = _terminal_caps()
     if mode in (None, "auto"):
@@ -682,7 +751,7 @@ def render(width, height, rows, max_width=None, max_height=None, mode="auto", ce
         raise ValueError("mode must be one of: " + ", ".join(MODES))
     cw, ch = cell or caps["cell"]
 
-    columns, lines = shutil.get_terminal_size((80, 24))
+    columns, lines = _term_size or shutil.get_terminal_size((80, 24))
     cols_avail = max(1, min(columns, max_width or columns))
     rows_avail = max(1, max_height or max(1, lines - 2))
     box_w, box_h = cols_avail * cw, rows_avail * ch
@@ -710,6 +779,71 @@ def render(width, height, rows, max_width=None, max_height=None, mode="auto", ce
     return _render_kitty(png, cols) if mode == "kitty" else _render_iterm2(png, cols)
 
 
+# Rendered output is kept in memory: showing the same image again (a menu that
+# redraws on every key press) is a dictionary lookup instead of a decode + render.
+_CACHE = {}
+_PENDING = {}
+_LOCK = threading.Lock()
+_CACHE_LIMIT = 32
+
+
+def _resolve(path, folder):
+    """Return (source, error_message). source is a Path or a URL string."""
+    path = str(path)
+    if path.startswith(("http://", "https://")):
+        return path, None
+    target = Path(path).expanduser()
+    if folder is not None and not target.is_absolute():
+        target = Path(folder).expanduser() / target
+    if target.suffix.lower() != ".png":
+        return None, (f"Only PNGs can be displayed without external libraries "
+                      f"(received: {target.suffix or 'no extension'}).")
+    if not target.exists():
+        return None, f"Image not found: {target.resolve()}"
+    return target, None
+
+
+def _make_key(source, max_width, max_height, mode, background, cell):
+    caps = _terminal_caps()
+    if isinstance(source, Path):
+        st = source.stat()
+        ident = (str(source.resolve()), st.st_mtime_ns, st.st_size)  # reload if the file changes
+    else:
+        ident = (source,)
+    size = tuple(shutil.get_terminal_size((80, 24)))
+    return (ident, max_width, max_height, mode, tuple(background),
+            tuple(cell) if cell else None, size, caps["mode"], caps["cell"], _truecolor())
+
+
+def _cached_output(key, source, max_width, max_height, mode, background, cell, size):
+    """Return the rendered string for 'key', building it at most once (even across threads)."""
+    while True:
+        with _LOCK:
+            if key in _CACHE:
+                return _CACHE[key]
+            event = _PENDING.get(key)
+            if event is None:
+                event = _PENDING[key] = threading.Event()
+                mine = True
+            else:
+                mine = False
+        if not mine:
+            event.wait()  # another thread (preload) is already building it
+            continue
+        try:
+            width, height, rows = read_png(source, background)
+            output = render(width, height, rows, max_width, max_height, mode, cell, _term_size=size)
+            with _LOCK:
+                if len(_CACHE) >= _CACHE_LIMIT:
+                    _CACHE.pop(next(iter(_CACHE)))
+                _CACHE[key] = output
+            return output
+        finally:
+            with _LOCK:
+                _PENDING.pop(key, None)
+            event.set()
+
+
 def show_image(path, folder=None, max_width=None, max_height=None,
                mode="auto", background=(0, 0, 0), cell=None):
     """
@@ -722,32 +856,61 @@ def show_image(path, folder=None, max_width=None, max_height=None,
     mode:        "auto" (default), "sixel", "kitty", "iterm2" or "blocks".
     background:  (r, g, b) color that transparent pixels are blended with.
     cell:        (width, height) of a character cell in pixels (optional).
+
+    The rendered result is cached: drawing the same image again is instant.
     """
     prepare_terminal()
-    path = str(path)
-    is_url = path.startswith(("http://", "https://"))
-
-    if not is_url:
-        target = Path(path).expanduser()
-        if folder is not None and not target.is_absolute():
-            target = Path(folder).expanduser() / target
-        if target.suffix.lower() != ".png":
-            print(f"Only PNGs can be displayed without external libraries "
-                  f"(received: {target.suffix or 'no extension'}).")
-            return
-        if not target.exists():
-            print(f"Image not found: {target.resolve()}")
-            return
-        path = target
+    source, problem = _resolve(path, folder)
+    if problem:
+        print(problem)
+        return
 
     try:
-        width, height, rows = read_png(path, background)
+        key = _make_key(source, max_width, max_height, mode, background, cell)
+        output = _cached_output(key, source, max_width, max_height, mode, background, cell,
+                                tuple(shutil.get_terminal_size((80, 24))))
     except Exception as error:
         print(f"The image could not be read: {error}")
         return
 
-    sys.stdout.write(render(width, height, rows, max_width, max_height, mode, cell) + "\n")
+    sys.stdout.write(output + "\n")
     sys.stdout.flush()
+
+
+def preload(path, folder=None, max_width=None, max_height=None,
+            mode="auto", background=(0, 0, 0), cell=None, threaded=True):
+    """
+    Decode and render an image ahead of time so the first show_image() is instant.
+
+    Call it with the same arguments you will pass to show_image(). By default the
+    work runs in a background thread and preload() returns immediately; use
+    threaded=False to wait until it is done. Errors are ignored here: show_image()
+    will report them when it is called.
+    """
+    try:
+        prepare_terminal()
+        source, problem = _resolve(path, folder)
+        if problem:
+            return None
+        # Terminal detection talks to stdin/stdout, so do it here in the caller's
+        # thread (never in the background one, which would fight with key input).
+        key = _make_key(source, max_width, max_height, mode, background, cell)
+        size = tuple(shutil.get_terminal_size((80, 24)))
+    except Exception:
+        return None
+
+    def work():
+        try:
+            _cached_output(key, source, max_width, max_height, mode, background, cell, size)
+        except Exception:
+            pass
+
+    if not threaded:
+        work()
+        return None
+    thread = threading.Thread(target=work, name="imgterm-preload", daemon=True)
+    thread.start()
+    return thread
 
 
 def _parse_color(text):
