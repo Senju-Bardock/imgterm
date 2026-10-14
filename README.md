@@ -43,6 +43,21 @@ Tip: use a tag or a commit instead of `main` (`.../imgterm/v0.1.0/imgterm.py`) s
 
 `imgterm.py` is a single file; just drop it next to your project.
 
+## Speed: caching and preload
+
+Decoding a PNG in pure Python takes a moment (roughly proportional to the number of pixels). `imgterm` keeps every rendered image in memory, so **showing the same image again is practically instant**. The first time can be hidden by decoding in the background at startup:
+
+```python
+from imgterm import show_image, preload
+
+preload("Senju_Bardock.png", folder="visual", max_width=40)  # returns immediately
+
+# ...later, inside a menu that redraws on every key press:
+show_image("Senju_Bardock.png", folder="visual", max_width=40)  # instant
+```
+
+Use the same `folder`, `max_width` and `max_height` in both calls. The cache is refreshed automatically if the file changes or the terminal is resized. Tip: images much bigger than what is shown (e.g. 2000 px wide for a 40-column display) only slow down the first decode; a smaller PNG looks the same.
+
 ## Example
 
 See [`example.py`](example.py) for a runnable demo:
@@ -57,6 +72,7 @@ python example.py path/to/your_image.png
 | Function | Description |
 | --- | --- |
 | `show_image(path, folder=None, max_width=None, max_height=None)` | Draws a PNG (path or URL) in the terminal |
+| `preload(path, folder=None, max_width=None, max_height=None, background=True)` | Decodes and renders ahead of time (in a background thread) so the first `show_image` is instant |
 | `read_png(source)` | Decodes a PNG and returns `(width, height, rows)` |
 | `render(width, height, rows, max_width=None, max_height=None)` | Returns the ANSI string, ready to print |
 
