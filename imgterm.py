@@ -1,7 +1,7 @@
 """
 imgterm.py
-Display a PNG or JPEG image in the terminal (Windows, Linux, macOS) using ONLY
-the Python standard library: nothing to pip install.
+Display a PNG, JPEG or (animated) GIF image in the terminal (Windows, Linux,
+macOS) using ONLY the Python standard library: nothing to pip install.
 
 It picks the best renderer your terminal supports:
 
@@ -15,6 +15,8 @@ Usage as a module:
     from imgterm import show_image
     show_image("photo.png")                         # relative or absolute path
     show_image("photo.jpg")                         # JPEG works the same way
+    show_image("dance.gif")                         # GIFs are animated (Ctrl+C stops it)
+    show_image("dance.gif", loops=2)                # play it twice (0 = forever)
     show_image("Senju_Bardock.png", folder="visual")
     show_image("https://site.com/image.png")        # URLs work too
     show_image("photo.png", max_width=60)           # limit width (columns)
@@ -23,6 +25,7 @@ Usage as a module:
 Usage from the terminal:
     python imgterm.py photo.png
     python imgterm.py photo.png --folder visual --width 60 --mode sixel
+    python imgterm.py dance.gif --loops 3
 
 Environment variables (optional):
     IMGTERM_MODE   sixel | kitty | iterm2 | blocks   (skips auto-detection)
@@ -44,10 +47,10 @@ import urllib.request
 import zlib
 from array import array
 from functools import lru_cache
-from itertools import accumulate, chain, groupby
+from itertools import accumulate, chain, count, groupby
 from pathlib import Path
 
-__all__ = ["show_image", "preload", "read_image", "read_png", "render", "detect_mode"]
+__all__ = ["show_image", "preload", "read_image", "read_gif", "read_png", "render", "detect_mode"]
 
 MODES = ("auto", "sixel", "kitty", "iterm2", "blocks")
 DEFAULT_CELL = (9, 18)  # pixels (width, height) of a character cell if unknown
@@ -922,8 +925,224 @@ def _decode_jpeg(data, box=None):
     return out_w, out_h, rows
 
 
+# ---------------------------------------------------------------------------
+# 2c. GIF decoder (stdlib only): GIF87a/GIF89a, LZW, interlacing, transparency,
+#     disposal methods and animation. Every frame is composed on the full-size
+#     canvas, so the caller just gets complete pictures.
+# ---------------------------------------------------------------------------
+_GIF_MAGIC = (b"GIF87a", b"GIF89a")
+_GIF_INTERLACE = ((0, 8), (4, 8), (2, 4), (1, 2))  # (first row, step) of the 4 passes
+
+
+def _gif_palette(raw):
+    """Color table bytes -> list of 256 (r, g, b) tuples (padded with black)."""
+    table = [tuple(raw[i:i + 3]) for i in range(0, len(raw) - 2, 3)]
+    return table + [(0, 0, 0)] * (256 - len(table))
+
+
+def _gif_subblocks(data, pos):
+    """Join the data sub-blocks that start at 'pos'. Returns (bytes, position after)."""
+    chunks = []
+    size = len(data)
+    while pos < size:
+        n = data[pos]
+        pos += 1
+        if n == 0:
+            break
+        chunks.append(data[pos:pos + n])
+        pos += n
+    return b"".join(chunks), pos
+
+
+def _gif_lzw(data, min_code, limit):
+    """GIF flavour of LZW (LSB first, codes of 2-12 bits) -> bytearray of palette indexes."""
+    clear = 1 << min_code
+    eoi = clear + 1
+    first_size = min_code + 1
+    base = [bytes((i,)) for i in range(clear)]
+    table = base + [b"", b""]
+    size = first_size
+    mask = (1 << size) - 1
+    nxt = eoi + 1  # next free code == len(table)
+    out = bytearray()
+    prev = None
+    buf = bits = 0
+    for byte in data:
+        buf |= byte << bits
+        bits += 8
+        while bits >= size:
+            code = buf & mask
+            buf >>= size
+            bits -= size
+            if code == clear:
+                del table[eoi + 1:]
+                size = first_size
+                mask = (1 << size) - 1
+                nxt = eoi + 1
+                prev = None
+                continue
+            if code == eoi:
+                return out
+            if prev is None:  # first code after a clear: must be a literal
+                if code >= clear:
+                    raise ValueError("Corrupt GIF data.")
+                entry = table[code]
+            elif code < nxt:
+                entry = table[code]
+            elif code == nxt:  # the code being defined right now (KwKwK case)
+                entry = prev + prev[:1]
+            else:
+                raise ValueError("Corrupt GIF data.")
+            out += entry
+            if prev is not None and nxt < 4096:
+                table.append(prev + entry[:1])
+                nxt += 1
+                if nxt == (1 << size) and size < 12:
+                    size += 1
+                    mask = (1 << size) - 1
+            prev = entry
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _gif_fill(canvas, rect, color):
+    """Paint a rectangle of the canvas with one color (rows are replaced, never edited)."""
+    x0, y0, x1, y1 = rect
+    for y in range(y0, y1):
+        row = canvas[y][:]
+        row[x0:x1] = [color] * (x1 - x0)
+        canvas[y] = row
+
+
+def _decode_gif(data, background=(0, 0, 0)):
+    """
+    Returns (width, height, info, frames).
+
+    frames is a generator of (rows, delay_in_seconds). Each rows is the COMPLETE
+    picture (previous frames, transparency and disposal methods already applied)
+    as a list of lists of (r, g, b); treat it as read-only, rows are shared
+    between frames. Decoding is lazy: a frame is only decoded when it is asked for.
+
+    info["loops"]: None = the file has no loop extension (play once),
+                   0 = loop forever, n = repeat n more times.
+    """
+    if data[:6] not in _GIF_MAGIC:
+        raise ValueError("The file is not a valid GIF.")
+    if len(data) < 13:
+        raise ValueError("Corrupt GIF header.")
+    width, height, flags = struct.unpack("<HHB", data[6:11])
+    if width == 0 or height == 0:
+        raise ValueError("Invalid GIF size.")
+    pos = 13
+    global_table = None
+    if flags & 0x80:
+        n = 3 * (2 << (flags & 7))
+        global_table = _gif_palette(data[pos:pos + n])
+        pos += n
+    info = {"loops": None}
+    bg = tuple(background)
+
+    def frames(pos):
+        canvas = [[bg] * width for _ in range(height)]
+        size = len(data)
+        disposal = delay = 0  # of the NEXT image, set by the graphic control extension
+        trans = None
+        prev_disposal = 0
+        prev_rect = saved = None
+        produced = 0
+        try:
+            while pos < size:
+                block = data[pos]
+                pos += 1
+                if block == 0x3B:  # trailer
+                    break
+                if block == 0x21:  # extension
+                    label = data[pos]
+                    body, pos = _gif_subblocks(data, pos + 1)
+                    if label == 0xF9 and len(body) >= 4:  # graphic control
+                        disposal = (body[0] >> 2) & 7
+                        delay = body[1] | (body[2] << 8)
+                        trans = body[3] if body[0] & 1 else None
+                    elif label == 0xFF and body[:11] in (b"NETSCAPE2.0", b"ANIMEXTS1.0") \
+                            and body[11:12] == b"\x01" and len(body) >= 14:
+                        info["loops"] = body[12] | (body[13] << 8)
+                    continue
+                if block != 0x2C:  # not an image descriptor: skip garbage
+                    continue
+
+                left, top, fw, fh, fl = struct.unpack("<HHHHB", data[pos:pos + 9])
+                pos += 9
+                palette = global_table
+                if fl & 0x80:
+                    n = 3 * (2 << (fl & 7))
+                    palette = _gif_palette(data[pos:pos + n])
+                    pos += n
+                if palette is None:  # no color table at all: fall back to grays
+                    palette = [(i, i, i) for i in range(256)]
+                min_code = data[pos]
+                pos += 1
+                if not 1 <= min_code <= 11:
+                    raise ValueError("Corrupt GIF data.")
+                body, pos = _gif_subblocks(data, pos)
+                need = fw * fh
+                idx = _gif_lzw(body, min_code, need)
+                if len(idx) < need:
+                    idx += bytes(need - len(idx))
+
+                # 1) undo what the previous frame asked for
+                if prev_disposal == 2 and prev_rect:
+                    _gif_fill(canvas, prev_rect, bg)
+                elif prev_disposal == 3 and saved is not None:
+                    canvas = saved
+                saved = list(canvas) if disposal == 3 else None
+
+                # 2) draw this frame (rows are copied before being changed)
+                if fl & 0x40:
+                    order = [y for start, step in _GIF_INTERLACE for y in range(start, fh, step)]
+                else:
+                    order = range(fh)
+                x0, x1 = left, min(left + fw, width)
+                y1 = min(top + fh, height)
+                if x1 > x0:
+                    span = x1 - x0
+                    for k, y in enumerate(order):
+                        cy = top + y
+                        if cy >= height:
+                            continue
+                        line = idx[k * fw:k * fw + span]
+                        old = canvas[cy]
+                        new = old[:]
+                        if trans is None:
+                            new[x0:x1] = [palette[i] for i in line]
+                        else:
+                            new[x0:x1] = [o if i == trans else palette[i]
+                                          for i, o in zip(line, old[x0:x1])]
+                        canvas[cy] = new
+
+                seconds = delay / 100
+                if seconds < 0.02:  # browsers treat 0 and 1 centiseconds as 10
+                    seconds = 0.1
+                prev_disposal, prev_rect = disposal, (x0, top, x1, y1)
+                disposal = delay = 0
+                trans = None
+                produced += 1
+                yield list(canvas), seconds
+        except Exception as error:
+            if produced == 0:
+                if isinstance(error, ValueError):
+                    raise
+                raise ValueError("Corrupt or unsupported GIF.") from error
+            return  # truncated file: keep the frames that were fine
+        if produced == 0:
+            raise ValueError("No image found in the GIF file.")
+
+    return width, height, info, frames(pos)
+
+
 def _decode_image(data, background=(0, 0, 0), box=None):
-    """Decode PNG or JPEG bytes (detected from the first bytes, not from the name)."""
+    """Decode PNG, JPEG or GIF bytes (detected from the first bytes, not from the name).
+    For an animated GIF this returns the first frame."""
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         return _decode_png(data, background)
     if data[:2] == b"\xff\xd8":
@@ -933,28 +1152,47 @@ def _decode_image(data, background=(0, 0, 0), box=None):
             raise
         except Exception as error:
             raise ValueError("Corrupt or unsupported JPEG.") from error
-    raise ValueError("Unsupported image format (only PNG and JPEG).")
+    if data[:6] in _GIF_MAGIC:
+        width, height, _, frames = _decode_gif(data, background)
+        return width, height, next(frames)[0]
+    raise ValueError("Unsupported image format (only PNG, JPEG and GIF).")
+
+
+def _read_bytes(source):
+    """Contents of a file path or http(s) URL."""
+    source = str(source)
+    if source.startswith(("http://", "https://")):
+        with urllib.request.urlopen(source, timeout=15) as response:
+            return response.read()
+    return Path(source).read_bytes()
 
 
 def read_image(source, background=(0, 0, 0), box=None):
     """
-    Read a PNG or JPEG from a path or URL and return (width, height, rows).
+    Read a PNG, JPEG or GIF from a path or URL and return (width, height, rows).
+    For an animated GIF this is the first frame (see read_gif for all of them).
 
-    background: (r, g, b) color that PNG transparency is blended with.
+    background: (r, g, b) color that PNG/GIF transparency is blended with.
     box:        optional (pixels wide, pixels high) of the area the picture will be
                 drawn in; lets big JPEGs be decoded at a reduced size (faster).
     """
-    source = str(source)
-    if source.startswith(("http://", "https://")):
-        with urllib.request.urlopen(source, timeout=15) as response:
-            data = response.read()
-    else:
-        data = Path(source).read_bytes()
-    return _decode_image(data, background, box)
+    return _decode_image(_read_bytes(source), background, box)
+
+
+def read_gif(source, background=(0, 0, 0)):
+    """
+    Read a GIF from a path or URL. Returns (width, height, frames, loops):
+
+        frames  list of (rows, delay_in_seconds); every rows is the complete picture
+                (list of lists of (r, g, b)), do not modify it
+        loops   None = play once, 0 = forever, n = repeat n more times
+    """
+    width, height, info, frames = _decode_gif(_read_bytes(source), background)
+    return width, height, list(frames), info["loops"]
 
 
 def read_png(source, background=(0, 0, 0)):
-    """Read an image (PNG or JPEG) from a path or URL: (width, height, rows)."""
+    """Read an image (PNG, JPEG or GIF) from a path or URL: (width, height, rows)."""
     return read_image(source, background)
 
 
@@ -1249,13 +1487,15 @@ def _encode_png(img, w, h):
             + chunk(b"IEND", b""))
 
 
-def _render_kitty(png, cols):
+def _render_kitty(png, cols, image_id=None):
+    """image_id is used by animations: the previous frame with that id is deleted first."""
     b64 = base64.standard_b64encode(png).decode("ascii")
     pieces = [b64[i:i + 4096] for i in range(0, len(b64), 4096)]
-    out = []
+    extra = ",i=%d" % image_id if image_id else ""
+    out = ["\x1b_Ga=d,d=I,i=%d,q=2\x1b\\" % image_id] if image_id else []
     for n, piece in enumerate(pieces):
         more = 1 if n < len(pieces) - 1 else 0
-        control = "a=T,f=100,q=2,c=%d,m=%d" % (cols, more) if n == 0 else "m=%d" % more
+        control = "a=T,f=100,q=2,c=%d%s,m=%d" % (cols, extra, more) if n == 0 else "m=%d" % more
         out.append("\x1b_G%s;%s\x1b\\" % (control, piece))
     return "".join(out)
 
@@ -1278,7 +1518,8 @@ def _pixel_box(max_width, max_height, cell, term_size):
     return cols_avail * cw, rows_avail * ch
 
 
-def render(width, height, rows, max_width=None, max_height=None, mode="auto", cell=None, _term_size=None):
+def render(width, height, rows, max_width=None, max_height=None, mode="auto", cell=None, _term_size=None,
+           _kitty_id=None):
     """Turn decoded pixels into a string ready to print with the chosen renderer."""
     caps = _terminal_caps()
     if mode in (None, "auto"):
@@ -1310,7 +1551,7 @@ def render(width, height, rows, max_width=None, max_height=None, mode="auto", ce
         png = _encode_png(_resize(rows, width, height, pw, ph), pw, ph)
     else:
         png = _encode_png(rows, width, height)
-    return _render_kitty(png, cols) if mode == "kitty" else _render_iterm2(png, cols)
+    return _render_kitty(png, cols, _kitty_id) if mode == "kitty" else _render_iterm2(png, cols)
 
 
 # Rendered output is kept in memory: showing the same image again (a menu that
@@ -1319,6 +1560,232 @@ _CACHE = {}
 _PENDING = {}
 _LOCK = threading.Lock()
 _CACHE_LIMIT = 32
+_KITTY_IDS = count(1)  # one kitty image id per animation
+
+
+def _gif_delays(data):
+    """
+    Frame delays (seconds) of a GIF, read by walking its blocks WITHOUT decoding any
+    pixel (takes a few milliseconds). Used to know the length of the animation before
+    it is rendered. Returns None if the structure can not be followed.
+    """
+    try:
+        size = len(data)
+        flags = data[10]
+        pos = 13 + (3 * (2 << (flags & 7)) if flags & 0x80 else 0)
+        delays = []
+        delay = 0
+        while pos < size:
+            block = data[pos]
+            pos += 1
+            if block == 0x3B:
+                break
+            if block == 0x21:
+                label = data[pos]
+                if label == 0xF9 and data[pos + 1] >= 4:
+                    delay = data[pos + 3] | (data[pos + 4] << 8)
+                _, pos = _gif_subblocks(data, pos + 1)
+            elif block == 0x2C:
+                fl = data[pos + 8]
+                pos += 9
+                if fl & 0x80:
+                    pos += 3 * (2 << (fl & 7))
+                _, pos = _gif_subblocks(data, pos + 1)  # skip min code size + LZW data
+                seconds = delay / 100
+                delays.append(0.1 if seconds < 0.02 else seconds)
+                delay = 0
+        return delays or None
+    except Exception:
+        return None
+
+
+class _Animation:
+    """
+    A GIF being rendered frame by frame by ONE background thread, while the main
+    thread only plays what is ready. Frames are kept as ready to print strings, so
+    every later loop is just a lookup. Thread safe: preload() and show_image() can
+    share the same animation.
+    """
+
+    MARGIN = 1.3  # safety factor over the measured render time per frame
+
+    def __init__(self, data, background, max_width, max_height, mode, cell, size):
+        self.width, self.height, self.info, self._frames = _decode_gif(data, background)
+        caps = _terminal_caps()  # detected here, in the caller's thread
+        self.mode = caps["mode"] if mode in (None, "auto") else mode
+        if self.mode not in MODES[1:]:
+            raise ValueError("mode must be one of: " + ", ".join(MODES))
+        self._args = (max_width, max_height, self.mode, cell)
+        self._size = size
+        self._kitty_id = next(_KITTY_IDS)
+        self.outputs = []  # rendered frames
+        self.delays = []   # seconds each frame stays on screen
+        self.done = False
+        self.error = None
+        self._busy = 0.0   # seconds spent decoding + rendering so far
+        self._cond = threading.Condition()
+        self._worker = None
+        plan = _gif_delays(data)  # whole timeline, known before rendering anything
+        self.plan = plan
+        self._cum = [0.0] + list(accumulate(plan)) if plan else None
+        self.rows = self._text_rows(max_width, max_height, cell, size, caps)
+
+    def _text_rows(self, max_width, max_height, cell, size, caps):
+        """How many text lines one frame covers (to reserve room for the animation)."""
+        cw, ch = cell or caps["cell"]
+        width, height = self.width, self.height
+        box_w, box_h = _pixel_box(max_width, max_height, (cw, ch), size)
+        if self.mode == "sixel" and not (max_width or max_height):
+            box_w, box_h = min(box_w, 2 * width), min(box_h, 2 * height)
+        pw, ph = _fit(width, height, box_w, box_h)
+        if self.mode == "blocks":
+            return max(1, round(ph / ch))
+        if self.mode == "sixel":
+            return max(1, -(-ph // ch))
+        cols = max(1, round(pw / cw))  # kitty / iterm2: the terminal keeps the aspect ratio
+        return max(1, math.ceil(cols * cw * height / width / ch))
+
+    # -- producer ---------------------------------------------------------
+    def start(self):
+        """Start rendering in the background (only the first call does anything)."""
+        with self._cond:
+            if self._worker is None and not self.done:
+                self._worker = threading.Thread(target=self._run, name="imgterm-render", daemon=True)
+                self._worker.start()
+
+    def _run(self):
+        max_width, max_height, mode, cell = self._args
+        while True:
+            began = time.perf_counter()
+            try:
+                rows, delay = next(self._frames)
+                output = render(self.width, self.height, rows, max_width, max_height, mode,
+                                cell, _term_size=self._size, _kitty_id=self._kitty_id)
+            except StopIteration:
+                break
+            except Exception as error:
+                if not self.outputs:
+                    self.error = error
+                break  # a damaged tail only shortens the animation
+            spent = time.perf_counter() - began
+            with self._cond:
+                self.outputs.append(output)
+                self.delays.append(delay)
+                self._busy += spent
+                self._cond.notify_all()
+        with self._cond:
+            self.done = True
+            self._cond.notify_all()
+
+    # -- consumer ---------------------------------------------------------
+    def get(self, index):
+        """Wait until frame 'index' is rendered. Returns False if the GIF has no such frame."""
+        self.start()
+        with self._cond:
+            while len(self.outputs) <= index and not self.done:
+                self._cond.wait()
+            if index < len(self.outputs):
+                return True
+        if index == 0 and self.error is not None:
+            raise self.error
+        return False
+
+    def load_all(self):
+        self.start()
+        with self._cond:
+            while not self.done:
+                self._cond.wait()
+
+    def _can_play_smoothly(self):
+        """True when, starting to play right now, no frame would be late (cond held)."""
+        k = len(self.outputs)
+        if self.done:
+            return True
+        if k == 0:
+            return False
+        if self._cum is None:  # timeline unknown: start as soon as there is a picture
+            return True
+        total = len(self._cum) - 1
+        if k >= total:
+            return True
+        rate = self._busy / k * self.MARGIN
+        cum = self._cum
+        # frame j is drawn at cum[j] seconds from now; it is ready after (j - k + 1) renders
+        return all((j - k + 1) * rate <= cum[j] for j in range(k, total))
+
+    def wait_until_smooth(self, on_wait=None, patience=0.25):
+        """Block until playing can not stutter. on_wait(done, total) is called while waiting."""
+        self.start()
+        began = time.perf_counter()
+        with self._cond:
+            while not self._can_play_smoothly():
+                self._cond.wait(0.05)
+                if on_wait and time.perf_counter() - began > patience:
+                    total = len(self._cum) - 1 if self._cum else 0
+                    on_wait(len(self.outputs), total)
+        if self.error is not None and not self.outputs:
+            raise self.error
+
+
+def _animate(anim, loops=None, smooth=True):
+    """Play an animation in place: every frame is drawn over the previous one."""
+    out = sys.stdout
+    if not anim.get(0):
+        raise ValueError("No image found in the GIF file.")
+    if not out.isatty() or not anim.get(1):  # output is not a terminal, or a single frame
+        out.write(anim.outputs[0] + "\n")
+        out.flush()
+        return
+
+    if loops is None:  # follow the GIF: no extension = once, 0 = forever, n = n repeats
+        file_loops = anim.info["loops"]
+        loops = 1 if file_loops is None else (0 if file_loops == 0 else file_loops + 1)
+
+    rows = anim.rows
+    # Reserve the lines first (so nothing scrolls while playing), go back to the top
+    # of that area and remember it (ESC 7); every frame starts with ESC 8 to return.
+    out.write("\r\x1b[?25l" + "\n" * rows + "\x1b[%dA" % rows + "\x1b7")
+    out.flush()
+    switch = sys.getswitchinterval()
+    sys.setswitchinterval(0.001)  # the render thread must not make the player wait for the GIL
+    try:
+        if smooth:  # first pass: wait just long enough to never stutter afterwards
+            shown = []
+
+            def progress(done, total):
+                text = "buffering %d%%" % (100 * done // total) if total else "buffering..."
+                out.write("\x1b8\x1b[2K" + text)
+                out.flush()
+                shown.append(1)
+
+            anim.wait_until_smooth(progress)
+            if shown:
+                out.write("\x1b8\x1b[2K")
+        played = 0
+        deadline = time.perf_counter()
+        while loops == 0 or played < loops:
+            index = 0
+            while True:
+                if len(anim.outputs) <= index:  # not ready yet (only with smooth=False)
+                    if not anim.get(index):
+                        break
+                    deadline = time.perf_counter()  # don't try to catch up
+                out.write("\x1b8" + anim.outputs[index])
+                out.flush()
+                deadline += anim.delays[index]
+                wait = deadline - time.perf_counter()
+                if wait > 0:
+                    time.sleep(wait)
+                else:
+                    deadline = time.perf_counter()
+                index += 1
+            played += 1
+    except KeyboardInterrupt:
+        pass
+    finally:  # leave the cursor right below the picture, like a still image would
+        sys.setswitchinterval(switch)
+        out.write("\x1b8\x1b[%dB\r\x1b[?25h" % rows)
+        out.flush()
 
 
 def _resolve(path, folder):
@@ -1329,8 +1796,8 @@ def _resolve(path, folder):
     target = Path(path).expanduser()
     if folder is not None and not target.is_absolute():
         target = Path(folder).expanduser() / target
-    if target.suffix.lower() not in (".png", ".jpg", ".jpeg"):
-        return None, (f"Only PNG and JPEG images can be displayed without external libraries "
+    if target.suffix.lower() not in (".png", ".jpg", ".jpeg", ".gif"):
+        return None, (f"Only PNG, JPEG and GIF images can be displayed without external libraries "
                         f"(received: {target.suffix or 'no extension'}).")
     if not target.exists():
         return None, f"Image not found: {target.resolve()}"
@@ -1366,8 +1833,13 @@ def _cached_output(key, source, max_width, max_height, mode, background, cell, s
             continue
         try:
             box = _pixel_box(max_width, max_height, cell or _terminal_caps()["cell"], size)
-            width, height, rows = read_image(source, background, box)
-            output = render(width, height, rows, max_width, max_height, mode, cell, _term_size=size)
+            data = _read_bytes(source)
+            if data[:6] in _GIF_MAGIC:  # animation: frames are rendered on demand
+                output = _Animation(data, background, max_width, max_height, mode, cell, size)
+            else:
+                width, height, rows = _decode_image(data, background, box)
+                output = render(width, height, rows, max_width, max_height, mode, cell,
+                                _term_size=size)
             with _LOCK:
                 if len(_CACHE) >= _CACHE_LIMIT:
                     _CACHE.pop(next(iter(_CACHE)))
@@ -1379,9 +1851,10 @@ def _cached_output(key, source, max_width, max_height, mode, background, cell, s
             event.set()
 
 
-def show_image(path, folder=None, max_width=None, max_height=None, mode="auto", background=(0, 0, 0), cell=None):
+def show_image(path, folder=None, max_width=None, max_height=None, mode="auto", background=(0, 0, 0), cell=None,
+               loops=None, smooth=True):
     """
-    Draw a PNG or JPEG image in the terminal.
+    Draw a PNG, JPEG or GIF image in the terminal. GIFs are animated in place.
 
     path:        path (relative or absolute) or URL of the image.
     folder:      folder to search in if 'path' is relative (optional).
@@ -1390,6 +1863,13 @@ def show_image(path, folder=None, max_width=None, max_height=None, mode="auto", 
     mode:        "auto" (default), "sixel", "kitty", "iterm2" or "blocks".
     background:  (r, g, b) color that transparent pixels are blended with.
     cell:        (width, height) of a character cell in pixels (optional).
+    loops:       GIF only: how many times to play it. None (default) follows the
+                 file (most GIFs loop forever: press Ctrl+C to stop), 0 = forever,
+                 1 = once, 2 = twice...  show_image() returns when it has finished.
+    smooth:      GIF only: True (default) waits, only if needed, until the animation can
+                 be played from the first frame to the last without stuttering (the rest
+                 is rendered in the background while it plays). False starts at once and
+                 may stutter during the first pass if rendering is slower than the GIF.
 
     The rendered result is cached: drawing the same image again is instant.
     """
@@ -1403,6 +1883,9 @@ def show_image(path, folder=None, max_width=None, max_height=None, mode="auto", 
         key = _make_key(source, max_width, max_height, mode, background, cell)
         output = _cached_output(key, source, max_width, max_height, mode, background, cell,
                                 tuple(shutil.get_terminal_size((80, 24))))
+        if isinstance(output, _Animation):
+            _animate(output, loops, smooth)
+            return
     except Exception as error:
         print(f"The image could not be read: {error}")
         return
@@ -1434,7 +1917,9 @@ def preload(path, folder=None, max_width=None, max_height=None, mode="auto", bac
 
     def work():
         try:
-            _cached_output(key, source, max_width, max_height, mode, background, cell, size)
+            output = _cached_output(key, source, max_width, max_height, mode, background, cell, size)
+            if isinstance(output, _Animation):
+                output.load_all()  # every frame, so the first play has no waits
         except Exception:
             pass
 
@@ -1452,8 +1937,8 @@ def _parse_color(text):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Show a PNG or JPEG in the terminal.")
-    parser.add_argument("image", help="path or URL of the PNG or JPEG")
+    parser = argparse.ArgumentParser(description="Show a PNG, JPEG or GIF in the terminal.")
+    parser.add_argument("image", help="path or URL of the PNG, JPEG or GIF")
     parser.add_argument("-f", "--folder", help="folder where the image is searched")
     parser.add_argument("-w", "--width", type=int, help="maximum width in columns")
     parser.add_argument("-H", "--height", type=int, help="maximum height in lines")
@@ -1461,6 +1946,10 @@ def main(argv=None):
                         help="renderer (default: auto-detect)")
     parser.add_argument("--bg", default="000000", help="background for transparency, RRGGBB")
     parser.add_argument("--cell", help="character cell size in pixels, e.g. 10x20")
+    parser.add_argument("-l", "--loops", type=int,
+                        help="GIF: times to play it, 0 = forever (default: what the file says; Ctrl+C stops)")
+    parser.add_argument("--no-smooth", action="store_true",
+                        help="GIF: start at once even if the first pass may stutter")
     args = parser.parse_args(argv)
 
     cell = None
@@ -1469,8 +1958,12 @@ def main(argv=None):
         if not m:
             parser.error("--cell must look like 10x20")
         cell = (int(m.group(1)), int(m.group(2)))
-    show_image(args.image, folder=args.folder, max_width=args.width, max_height=args.height,
-                mode=args.mode, background=_parse_color(args.bg), cell=cell)
+    try:
+        show_image(args.image, folder=args.folder, max_width=args.width, max_height=args.height,
+                    mode=args.mode, background=_parse_color(args.bg), cell=cell, loops=args.loops,
+                    smooth=not args.no_smooth)
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
