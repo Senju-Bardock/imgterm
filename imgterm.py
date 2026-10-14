@@ -1,7 +1,7 @@
 """
 imgterm.py
-Display a PNG image in the terminal (Windows, Linux, macOS) using ONLY the
-Python standard library: nothing to pip install.
+Display a PNG or JPEG image in the terminal (Windows, Linux, macOS) using ONLY
+the Python standard library: nothing to pip install.
 
 It picks the best renderer your terminal supports:
 
@@ -14,6 +14,7 @@ It picks the best renderer your terminal supports:
 Usage as a module:
     from imgterm import show_image
     show_image("photo.png")                         # relative or absolute path
+    show_image("photo.jpg")                         # JPEG works the same way
     show_image("Senju_Bardock.png", folder="visual")
     show_image("https://site.com/image.png")        # URLs work too
     show_image("photo.png", max_width=60)           # limit width (columns)
@@ -41,11 +42,12 @@ import threading
 import time
 import urllib.request
 import zlib
+from array import array
 from functools import lru_cache
 from itertools import accumulate, chain, groupby
 from pathlib import Path
 
-__all__ = ["show_image", "preload", "read_png", "render", "detect_mode"]
+__all__ = ["show_image", "preload", "read_image", "read_png", "render", "detect_mode"]
 
 MODES = ("auto", "sixel", "kitty", "iterm2", "blocks")
 DEFAULT_CELL = (9, 18)  # pixels (width, height) of a character cell if unknown
@@ -418,15 +420,542 @@ def _decode_png(data, background=(0, 0, 0)):
     return width, height, rows
 
 
-def read_png(source, background=(0, 0, 0)):
-    """Read a PNG from a path or URL and return (width, height, rows)."""
+# ---------------------------------------------------------------------------
+# 2b. JPEG decoder (stdlib only): baseline + progressive, Huffman, 8-bit,
+#     grayscale or YCbCr/RGB, any chroma subsampling, restart intervals.
+#     Not supported: arithmetic coding, lossless, 12-bit, CMYK/YCCK.
+# ---------------------------------------------------------------------------
+_ZIGZAG = (0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48,
+           41, 34, 27, 20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15,
+           23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63)
+
+_JPEG_SCAN_END = re.compile(rb"\xff[^\x00\xd0-\xd7\xff]")  # first real marker after scan data
+_JPEG_RESTART = re.compile(rb"\xff[\xd0-\xd7]")
+_JPEG_UNSUPPORTED = (0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF)
+
+# 1-D 8-point inverse DCT constants: K[n] = cos(n*pi/16) / 2
+_K1, _K2, _K3, _K4, _K5, _K6, _K7 = (0.5 * math.cos(i * math.pi / 16) for i in range(1, 8))
+
+# Clamp table indexed with y + offset where the offset may be negative (Python
+# wraps negative indexes): 0..255 -> same, 256..511 -> 255, -256..-1 -> 0.
+_CLAMP = bytes(range(256)) + bytes([255]) * 256 + bytes(256)
+_CR_R = [round(1.402 * (i - 128)) for i in range(256)]
+_CB_B = [round(1.772 * (i - 128)) for i in range(256)]
+_CB_G = [round(-0.344136 * (i - 128)) for i in range(256)]
+_CR_G = [round(-0.714136 * (i - 128)) for i in range(256)]
+
+
+def _idct_matrix(n):
+    """n-point inverse DCT matrix used to decode at 1/2, 1/4 or 1/8 size."""
+    return [[math.sqrt(n / 8) * (math.sqrt(1 / n) if u == 0 else math.sqrt(2 / n))
+             * math.cos((2 * x + 1) * u * math.pi / (2 * n)) for u in range(n)]
+            for x in range(n)]
+
+
+_IDCT_SMALL = {2: _idct_matrix(2), 4: _idct_matrix(4)}
+
+
+class _Component:
+    __slots__ = ("id", "h", "v", "tq", "bw", "bh", "bwm", "bhm", "coef", "pred", "dc", "ac")
+
+
+def _huffman_table(counts, symbols):
+    """16-bit lookup table: table[next 16 bits] = (code length << 8) | symbol."""
+    table = [0] * 65536
+    code = k = 0
+    for length in range(1, 17):
+        for _ in range(counts[length - 1]):
+            lo = code << (16 - length)
+            hi = (code + 1) << (16 - length)
+            if hi > 65536:
+                raise ValueError("Corrupt Huffman table.")
+            table[lo:hi] = [(length << 8) | symbols[k]] * (hi - lo)
+            code += 1
+            k += 1
+        code <<= 1
+    return table
+
+
+def _jpeg_scan(chunks, mcus_x, mcus_y, scomps, ri, progressive, ss, se, ah, al):
+    """Entropy-decode one scan into the coefficient arrays of its components."""
+    zz = _ZIGZAG
+    data = b""
+    pos = buf = cnt = eobrun = 0
+    # Bit reader: 'buf' holds 'cnt' valid bits in its low end. Every handler tops
+    # it up to >= 32 bits before a Huffman code (<= 16 bits) plus its extra bits.
+
+    def baseline(comp, off):
+        nonlocal pos, buf, cnt
+        coef, dc, ac = comp.coef, comp.dc, comp.ac
+        p, b, c = pos, buf, cnt
+        if c < 32:
+            b = ((b & ((1 << c) - 1)) << 32) | int.from_bytes(data[p:p + 4], "big")
+            c += 32
+            p += 4
+        e = dc[(b >> (c - 16)) & 0xFFFF]
+        c -= e >> 8
+        s = e & 255
+        if s:
+            v = (b >> (c - s)) & ((1 << s) - 1)
+            c -= s
+            comp.pred += v if v >= (1 << (s - 1)) else v - (1 << s) + 1
+        coef[off] = comp.pred
+        k = 1
+        while k < 64:
+            if c < 32:
+                b = ((b & ((1 << c) - 1)) << 32) | int.from_bytes(data[p:p + 4], "big")
+                c += 32
+                p += 4
+            e = ac[(b >> (c - 16)) & 0xFFFF]
+            c -= e >> 8
+            rs = e & 255
+            s = rs & 15
+            if s == 0:
+                if rs != 0xF0:  # end of block
+                    break
+                k += 16  # run of 16 zeros
+                continue
+            k += rs >> 4
+            if k > 63:
+                break
+            v = (b >> (c - s)) & ((1 << s) - 1)
+            c -= s
+            coef[off + zz[k]] = v if v >= (1 << (s - 1)) else v - (1 << s) + 1
+            k += 1
+        pos, buf, cnt = p, b, c
+
+    def dc_first(comp, off):
+        nonlocal pos, buf, cnt
+        dc = comp.dc
+        p, b, c = pos, buf, cnt
+        if c < 32:
+            b = ((b & ((1 << c) - 1)) << 32) | int.from_bytes(data[p:p + 4], "big")
+            c += 32
+            p += 4
+        e = dc[(b >> (c - 16)) & 0xFFFF]
+        c -= e >> 8
+        s = e & 255
+        if s:
+            v = (b >> (c - s)) & ((1 << s) - 1)
+            c -= s
+            comp.pred += v if v >= (1 << (s - 1)) else v - (1 << s) + 1
+        comp.coef[off] = comp.pred * (1 << al)
+        pos, buf, cnt = p, b, c
+
+    def dc_refine(comp, off):
+        nonlocal pos, buf, cnt
+        p, b, c = pos, buf, cnt
+        if c < 32:
+            b = ((b & ((1 << c) - 1)) << 32) | int.from_bytes(data[p:p + 4], "big")
+            c += 32
+            p += 4
+        c -= 1
+        if (b >> c) & 1:
+            comp.coef[off] |= 1 << al
+        pos, buf, cnt = p, b, c
+
+    def ac_first(comp, off):
+        nonlocal pos, buf, cnt, eobrun
+        if eobrun > 0:  # this block is inside a run of empty blocks
+            eobrun -= 1
+            return
+        coef, ac = comp.coef, comp.ac
+        p, b, c = pos, buf, cnt
+        k = ss
+        while k <= se:
+            if c < 32:
+                b = ((b & ((1 << c) - 1)) << 32) | int.from_bytes(data[p:p + 4], "big")
+                c += 32
+                p += 4
+            e = ac[(b >> (c - 16)) & 0xFFFF]
+            c -= e >> 8
+            rs = e & 255
+            s = rs & 15
+            r = rs >> 4
+            if s == 0:
+                if r < 15:  # EOBn: this block and (2^r + extra - 1) more are empty
+                    n = 1 << r
+                    if r:
+                        n += (b >> (c - r)) & ((1 << r) - 1)
+                        c -= r
+                    eobrun = n - 1
+                    break
+                k += 16
+                continue
+            k += r
+            if k > se:
+                break
+            v = (b >> (c - s)) & ((1 << s) - 1)
+            c -= s
+            if v < (1 << (s - 1)):
+                v -= (1 << s) - 1
+            coef[off + zz[k]] = v * (1 << al)
+            k += 1
+        pos, buf, cnt = p, b, c
+
+    def ac_refine(comp, off):
+        nonlocal pos, buf, cnt, eobrun
+        coef, ac = comp.coef, comp.ac
+        p1 = 1 << al
+        m1 = -p1
+        p, b, c = pos, buf, cnt
+        k = ss
+        if eobrun == 0:
+            while k <= se:
+                if c < 32:
+                    b = ((b & ((1 << c) - 1)) << 32) | int.from_bytes(data[p:p + 4], "big")
+                    c += 32
+                    p += 4
+                e = ac[(b >> (c - 16)) & 0xFFFF]
+                c -= e >> 8
+                rs = e & 255
+                r = rs >> 4
+                value = 0
+                if rs & 15:  # a newly non-zero coefficient: sign bit follows
+                    c -= 1
+                    value = p1 if (b >> c) & 1 else m1
+                elif r != 15:  # EOBn
+                    eobrun = 1 << r
+                    if r:
+                        eobrun += (b >> (c - r)) & ((1 << r) - 1)
+                        c -= r
+                    break
+                # skip 'r' zero coefficients, refining the non-zero ones on the way
+                while k <= se:
+                    if c < 32:
+                        b = ((b & ((1 << c) - 1)) << 32) | int.from_bytes(data[p:p + 4], "big")
+                        c += 32
+                        p += 4
+                    z = off + zz[k]
+                    v = coef[z]
+                    if v:
+                        c -= 1
+                        if (b >> c) & 1 and not v & p1:
+                            coef[z] = v + p1 if v >= 0 else v + m1
+                    else:
+                        r -= 1
+                        if r < 0:
+                            break
+                    k += 1
+                if value and k <= se:
+                    coef[off + zz[k]] = value
+                k += 1
+        if eobrun > 0:  # rest of the band: only refine the already non-zero coefficients
+            while k <= se:
+                if c < 32:
+                    b = ((b & ((1 << c) - 1)) << 32) | int.from_bytes(data[p:p + 4], "big")
+                    c += 32
+                    p += 4
+                z = off + zz[k]
+                v = coef[z]
+                if v:
+                    c -= 1
+                    if (b >> c) & 1 and not v & p1:
+                        coef[z] = v + p1 if v >= 0 else v + m1
+                k += 1
+            eobrun -= 1
+        pos, buf, cnt = p, b, c
+
+    if not progressive:
+        handler = baseline
+    elif ss == 0:
+        handler = dc_first if ah == 0 else dc_refine
+    else:
+        handler = ac_first if ah == 0 else ac_refine
+
+    single = len(scomps) == 1
+    first = scomps[0]
+    total = first.bw * first.bh if single else mcus_x * mcus_y
+    interval = ri or total
+    mcu = 0
+    for chunk in chunks:  # one chunk per restart interval
+        if mcu >= total:
+            break
+        data = chunk + bytes(8)
+        pos = buf = cnt = eobrun = 0
+        for sc in scomps:
+            sc.pred = 0
+        end = min(mcu + interval, total)
+        if single:
+            while mcu < end:
+                row, col = divmod(mcu, first.bw)
+                handler(first, (row * first.bwm + col) * 64)
+                mcu += 1
+        else:
+            while mcu < end:
+                mrow, mcol = divmod(mcu, mcus_x)
+                for sc in scomps:
+                    for j in range(sc.v):
+                        base = (mrow * sc.v + j) * sc.bwm + mcol * sc.h
+                        for i in range(sc.h):
+                            handler(sc, (base + i) * 64)
+                mcu += 1
+
+
+def _idct8(x0, x1, x2, x3, x4, x5, x6, x7,
+           K1=_K1, K2=_K2, K3=_K3, K4=_K4, K5=_K5, K6=_K6, K7=_K7):
+    """1-D 8-point inverse DCT (even/odd decomposition)."""
+    a = x0 * K4
+    e0 = a + x2 * K2 + x4 * K4 + x6 * K6
+    e1 = a + x2 * K6 - x4 * K4 - x6 * K2
+    e2 = a - x2 * K6 - x4 * K4 + x6 * K2
+    e3 = a - x2 * K2 + x4 * K4 - x6 * K6
+    o0 = x1 * K1 + x3 * K3 + x5 * K5 + x7 * K7
+    o1 = x1 * K3 - x3 * K7 - x5 * K1 - x7 * K5
+    o2 = x1 * K5 - x3 * K1 + x5 * K7 + x7 * K3
+    o3 = x1 * K7 - x3 * K5 + x5 * K3 - x7 * K1
+    return (e0 + o0, e1 + o1, e2 + o2, e3 + o3, e3 - o3, e2 - o2, e1 - o1, e0 - o0)
+
+
+def _byte(v):
+    v = int(v + 128.5)  # level shift + round
+    return 0 if v < 0 else 255 if v > 255 else v
+
+
+def _jpeg_block(blk, qt, n):
+    """Dequantize + inverse DCT of one block, keeping an n x n output (n = 8, 4, 2, 1)."""
+    if n == 1 or not any(blk[1:]):  # 1/8 size needs only the DC; or the block is flat
+        return [bytes([_byte(blk[0] * qt[0] / 8)]) * n] * n
+    if n == 8:
+        q = [c * f for c, f in zip(blk, qt)]
+        tmp = []
+        for o in range(0, 64, 8):
+            r0, r1, r2, r3, r4, r5, r6, r7 = q[o:o + 8]
+            if r1 or r2 or r3 or r4 or r5 or r6 or r7:
+                tmp.append(_idct8(r0, r1, r2, r3, r4, r5, r6, r7))
+            else:
+                tmp.append((r0 * _K4,) * 8)
+        cols = [_idct8(*col) for col in zip(*tmp)]
+        return [bytes([0 if t < 0 else 255 if t > 255 else t
+                       for t in [int(v + 128.5) for v in row]])
+                for row in zip(*cols)]
+    m = _IDCT_SMALL[n]
+    f = [[blk[8 * v + u] * qt[8 * v + u] for u in range(n)] for v in range(n)]
+    tmp = [[sum(m[x][u] * f[v][u] for u in range(n)) for x in range(n)] for v in range(n)]
+    return [bytes([_byte(sum(m[y][v] * tmp[v][x] for v in range(n))) for x in range(n)])
+            for y in range(n)]
+
+
+def _jpeg_plane(comp, qt, n):
+    """Decode every block of a component -> list of bytearray rows (bwm*n wide)."""
+    coef = comp.coef
+    rows = []
+    for br in range(comp.bhm):
+        lines = [bytearray() for _ in range(n)]
+        base = br * comp.bwm * 64
+        for off in range(base, base + comp.bwm * 64, 64):
+            out = _jpeg_block(coef[off:off + 64].tolist(), qt, n)
+            for y in range(n):
+                lines[y] += out[y]
+        rows += lines
+    return rows
+
+
+def _jpeg_upsample(plane, comp, hmax, vmax, out_w, out_h):
+    """Stretch a (sub-sampled) component plane to the full image size."""
+    h, v = comp.h, comp.v
+    if h == hmax and v == vmax:
+        return [r[:out_w] for r in plane[:out_h]]
+    cache = {}
+    out = []
+    for y in range(out_h):
+        sy = y * v // vmax
+        row = cache.get(sy)
+        if row is None:
+            src = plane[sy]
+            if hmax % h == 0:
+                f = hmax // h
+                wide = bytearray(len(src) * f)
+                for i in range(f):
+                    wide[i::f] = src
+                row = wide[:out_w]
+            else:
+                row = bytes([src[x * h // hmax] for x in range(out_w)])
+            cache[sy] = row
+        out.append(row)
+    return out
+
+
+def _decode_jpeg(data, box=None):
+    """
+    Returns (width, height, rows) with rows = list of lists of (r, g, b).
+
+    box: optional (pixels wide, pixels high) the picture will be drawn in. A big
+    photo is then decoded at 1/2, 1/4 or 1/8 size (using only the low frequencies
+    of every block), which is much faster and never goes below the needed size.
+    """
+    if data[:2] != b"\xff\xd8":
+        raise ValueError("The file is not a valid JPEG.")
+
+    qts, dc_tabs, ac_tabs = {}, {}, {}
+    comps = None
+    progressive = False
+    ri = 0
+    adobe = None
+    width = height = mcus_x = mcus_y = hmax = vmax = 0
+    pos = 2
+    size = len(data)
+    while pos + 2 <= size:
+        if data[pos] != 0xFF:
+            pos += 1
+            continue
+        marker = data[pos + 1]
+        if marker == 0xFF:  # fill byte
+            pos += 1
+            continue
+        pos += 2
+        if marker == 0x00 or marker == 0x01 or 0xD0 <= marker <= 0xD8:  # no payload
+            continue
+        if marker == 0xD9:  # end of image
+            break
+        length = (data[pos] << 8) | data[pos + 1]
+        body = data[pos + 2:pos + length]
+        pos += length
+
+        if marker == 0xDB:  # quantization tables
+            i = 0
+            while i < len(body):
+                precision, tq = body[i] >> 4, body[i] & 15
+                i += 1
+                table = [0] * 64
+                for k in range(64):
+                    if precision:
+                        table[_ZIGZAG[k]] = (body[i] << 8) | body[i + 1]
+                        i += 2
+                    else:
+                        table[_ZIGZAG[k]] = body[i]
+                        i += 1
+                qts[tq] = table
+        elif marker == 0xC4:  # Huffman tables
+            i = 0
+            while i < len(body):
+                tc, th = body[i] >> 4, body[i] & 15
+                counts = body[i + 1:i + 17]
+                total = sum(counts)
+                table = _huffman_table(counts, body[i + 17:i + 17 + total])
+                (ac_tabs if tc else dc_tabs)[th] = table
+                i += 17 + total
+        elif marker in (0xC0, 0xC1, 0xC2):  # start of frame
+            if body[0] != 8:
+                raise ValueError("Only 8-bit JPEG is supported (this one is %d-bit)." % body[0])
+            height = (body[1] << 8) | body[2]
+            width = (body[3] << 8) | body[4]
+            count = body[5]
+            if width == 0 or height == 0:
+                raise ValueError("Invalid JPEG size.")
+            if count not in (1, 3):
+                raise ValueError("Only grayscale and color (3 channel) JPEG is supported "
+                                 "(this one has %d channels, e.g. CMYK)." % count)
+            progressive = marker == 0xC2
+            comps = []
+            for i in range(count):
+                comp = _Component()
+                comp.id = body[6 + 3 * i]
+                comp.h, comp.v = body[7 + 3 * i] >> 4, body[7 + 3 * i] & 15
+                comp.tq = body[8 + 3 * i]
+                comp.pred = 0
+                comp.dc = comp.ac = None
+                if not (1 <= comp.h <= 4 and 1 <= comp.v <= 4):
+                    raise ValueError("Invalid JPEG sampling factors.")
+                comps.append(comp)
+            hmax = max(c.h for c in comps)
+            vmax = max(c.v for c in comps)
+            mcus_x = -(-width // (8 * hmax))
+            mcus_y = -(-height // (8 * vmax))
+            for comp in comps:
+                comp.bw = -(-(-(-width * comp.h // hmax)) // 8)
+                comp.bh = -(-(-(-height * comp.v // vmax)) // 8)
+                comp.bwm = mcus_x * comp.h
+                comp.bhm = mcus_y * comp.v
+                comp.coef = array("h", [0]) * (comp.bwm * comp.bhm * 64)
+        elif marker in _JPEG_UNSUPPORTED:
+            raise ValueError("This kind of JPEG is not supported (arithmetic coding, "
+                             "lossless or hierarchical).")
+        elif marker == 0xDD:  # restart interval
+            ri = (body[0] << 8) | body[1]
+        elif marker == 0xEE and body[:5] == b"Adobe" and len(body) > 11:
+            adobe = body[11]  # color transform: 0 = RGB, 1 = YCbCr
+        elif marker == 0xDA:  # start of scan
+            if comps is None:
+                raise ValueError("Corrupt JPEG (scan before frame header).")
+            ns = body[0]
+            scomps = []
+            for i in range(ns):
+                cid, tables = body[1 + 2 * i], body[2 + 2 * i]
+                comp = next(c for c in comps if c.id == cid)
+                comp.dc = dc_tabs.get(tables >> 4)
+                comp.ac = ac_tabs.get(tables & 15)
+                scomps.append(comp)
+            ss, se, successive = body[1 + 2 * ns], body[2 + 2 * ns], body[3 + 2 * ns]
+            found = _JPEG_SCAN_END.search(data, pos)
+            end = found.start() if found else size
+            chunks = [c.replace(b"\xff\x00", b"\xff")
+                      for c in _JPEG_RESTART.split(data[pos:end])]
+            _jpeg_scan(chunks, mcus_x, mcus_y, scomps, ri, progressive,
+                       ss, se, successive >> 4, successive & 15)
+            pos = end
+
+    if comps is None:
+        raise ValueError("No image found in the JPEG file.")
+
+    n = 8  # output size of every 8x8 block
+    if box:
+        scale = min(box[0] / width, box[1] / height)
+        for d in (8, 4, 2):
+            if d * scale <= 1:
+                n = 8 // d
+                break
+    out_w = -(-width * n // 8)
+    out_h = -(-height * n // 8)
+
+    ups = [_jpeg_upsample(_jpeg_plane(comp, qts[comp.tq], n), comp, hmax, vmax, out_w, out_h)
+           for comp in comps]
+    if len(comps) == 1:
+        rows = [list(zip(r, r, r)) for r in ups[0]]
+    elif adobe == 0 or tuple(c.id for c in comps) == (82, 71, 66):  # stored as plain RGB
+        rows = [list(zip(r, g, b)) for r, g, b in zip(*ups)]
+    else:  # YCbCr -> RGB
+        cl, crr, cbb, cbg, crg = _CLAMP, _CR_R, _CB_B, _CB_G, _CR_G
+        rows = [[(cl[y + crr[cr]], cl[y + cbg[cb] + crg[cr]], cl[y + cbb[cb]])
+                 for y, cb, cr in zip(yr, cbr, crr_)]
+                for yr, cbr, crr_ in zip(*ups)]
+    return out_w, out_h, rows
+
+
+def _decode_image(data, background=(0, 0, 0), box=None):
+    """Decode PNG or JPEG bytes (detected from the first bytes, not from the name)."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return _decode_png(data, background)
+    if data[:2] == b"\xff\xd8":
+        try:
+            return _decode_jpeg(data, box)
+        except ValueError:
+            raise
+        except Exception as error:
+            raise ValueError("Corrupt or unsupported JPEG.") from error
+    raise ValueError("Unsupported image format (only PNG and JPEG).")
+
+
+def read_image(source, background=(0, 0, 0), box=None):
+    """
+    Read a PNG or JPEG from a path or URL and return (width, height, rows).
+
+    background: (r, g, b) color that PNG transparency is blended with.
+    box:        optional (pixels wide, pixels high) of the area the picture will be
+                drawn in; lets big JPEGs be decoded at a reduced size (faster).
+    """
     source = str(source)
     if source.startswith(("http://", "https://")):
         with urllib.request.urlopen(source, timeout=15) as response:
             data = response.read()
     else:
         data = Path(source).read_bytes()
-    return _decode_png(data, background)
+    return _decode_image(data, background, box)
+
+
+def read_png(source, background=(0, 0, 0)):
+    """Read an image (PNG or JPEG) from a path or URL: (width, height, rows)."""
+    return read_image(source, background)
 
 
 # ---------------------------------------------------------------------------
@@ -740,6 +1269,15 @@ def _render_iterm2(png, cols):
 # ---------------------------------------------------------------------------
 # 5. Public API
 # ---------------------------------------------------------------------------
+def _pixel_box(max_width, max_height, cell, term_size):
+    """Size in pixels of the area an image may fill: (width, height)."""
+    cw, ch = cell
+    columns, lines = term_size
+    cols_avail = max(1, min(columns, max_width or columns))
+    rows_avail = max(1, max_height or max(1, lines - 2))
+    return cols_avail * cw, rows_avail * ch
+
+
 def render(width, height, rows, max_width=None, max_height=None, mode="auto", cell=None, _term_size=None):
     """Turn decoded pixels into a string ready to print with the chosen renderer."""
     caps = _terminal_caps()
@@ -749,10 +1287,8 @@ def render(width, height, rows, max_width=None, max_height=None, mode="auto", ce
         raise ValueError("mode must be one of: " + ", ".join(MODES))
     cw, ch = cell or caps["cell"]
 
-    columns, lines = _term_size or shutil.get_terminal_size((80, 24))
-    cols_avail = max(1, min(columns, max_width or columns))
-    rows_avail = max(1, max_height or max(1, lines - 2))
-    box_w, box_h = cols_avail * cw, rows_avail * ch
+    box_w, box_h = _pixel_box(max_width, max_height, (cw, ch),
+                                _term_size or shutil.get_terminal_size((80, 24)))
 
     if mode == "blocks":
         pw, ph = _fit(width, height, box_w, box_h)
@@ -793,8 +1329,8 @@ def _resolve(path, folder):
     target = Path(path).expanduser()
     if folder is not None and not target.is_absolute():
         target = Path(folder).expanduser() / target
-    if target.suffix.lower() != ".png":
-        return None, (f"Only PNGs can be displayed without external libraries "
+    if target.suffix.lower() not in (".png", ".jpg", ".jpeg"):
+        return None, (f"Only PNG and JPEG images can be displayed without external libraries "
                         f"(received: {target.suffix or 'no extension'}).")
     if not target.exists():
         return None, f"Image not found: {target.resolve()}"
@@ -829,7 +1365,8 @@ def _cached_output(key, source, max_width, max_height, mode, background, cell, s
             event.wait()  # another thread (preload) is already building it
             continue
         try:
-            width, height, rows = read_png(source, background)
+            box = _pixel_box(max_width, max_height, cell or _terminal_caps()["cell"], size)
+            width, height, rows = read_image(source, background, box)
             output = render(width, height, rows, max_width, max_height, mode, cell, _term_size=size)
             with _LOCK:
                 if len(_CACHE) >= _CACHE_LIMIT:
@@ -844,7 +1381,7 @@ def _cached_output(key, source, max_width, max_height, mode, background, cell, s
 
 def show_image(path, folder=None, max_width=None, max_height=None, mode="auto", background=(0, 0, 0), cell=None):
     """
-    Draw a PNG image in the terminal.
+    Draw a PNG or JPEG image in the terminal.
 
     path:        path (relative or absolute) or URL of the image.
     folder:      folder to search in if 'path' is relative (optional).
@@ -915,8 +1452,8 @@ def _parse_color(text):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Show a PNG in the terminal.")
-    parser.add_argument("image", help="path or URL of the PNG")
+    parser = argparse.ArgumentParser(description="Show a PNG or JPEG in the terminal.")
+    parser.add_argument("image", help="path or URL of the PNG or JPEG")
     parser.add_argument("-f", "--folder", help="folder where the image is searched")
     parser.add_argument("-w", "--width", type=int, help="maximum width in columns")
     parser.add_argument("-H", "--height", type=int, help="maximum height in lines")
