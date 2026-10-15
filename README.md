@@ -2,11 +2,28 @@
 
 Display PNG, JPEG and animated GIF images in the terminal (Windows, Linux, macOS) using **only the Python standard library**. No dependencies.
 
-## Option 1: install straight from GitHub (once)
+## Installation
+
+There are three ways to use `imgterm`. Pick the one that fits you:
+
+| | Option 1: `pip install` | Option 2: no install | Option 3: copy the file |
+| --- | --- | --- | --- |
+| **Best for** | Using it in many projects, or from the command line | Quick scripts you want to share as one file | No internet, no pip, or no Python at all |
+| **Needs Python** | Yes (3.8+) | Yes (3.8+) | `imgterm.exe`: no. `imgterm.py`: yes |
+| **Needs internet** | Only once, to install | Every time the script runs | Only once, to download |
+| **Adds the `imgterm` command** | Yes | No | `imgterm.exe` is the command itself |
+
+No matter which option you choose, `imgterm` has **no dependencies**: only the Python standard library.
+
+### Option 1: install with pip (recommended)
+
+Installs it once, then you can `import imgterm` from any script and use the `imgterm` command in any terminal.
 
 ```bash
 pip install git+https://github.com/Senju-Bardock/imgterm.git
 ```
+
+Use it from Python:
 
 ```python
 from imgterm import show_image
@@ -20,16 +37,20 @@ show_image("photo.png", max_width=60)
 show_image("https://example.com/image.png")
 ```
 
-The `imgterm` command is also available:
+Or from the terminal:
 
 ```bash
 imgterm photo.png --width 60
 imgterm dance.gif --loops 3
 ```
 
-## Option 2: no install, no download
+To update it later: `pip install --upgrade git+https://github.com/Senju-Bardock/imgterm.git`
 
-Paste this at the top of your script. It loads the module into memory from GitHub every time it runs (needs internet):
+> If `pip` is not found, try `python -m pip ...` (Windows) or `python3 -m pip ...` (Linux/macOS).
+
+### Option 2: no install, no download
+
+Nothing is installed on your computer. Paste this at the top of your script and it loads the module into memory from GitHub every time it runs (**needs internet**):
 
 ```python
 import types, urllib.request
@@ -43,9 +64,33 @@ imgterm.show_image("photo.png")
 
 Tip: use a tag or a commit instead of `main` (`.../imgterm/v0.1.0/imgterm.py`) so the code never changes without you knowing.
 
-## Option 3: copy the file
+### Option 3: copy the file
 
-`imgterm.exe` is a single file; just install it. You can use also `imgterm.py` and drop it next to your project.
+Download one file, put it where you want it, done. Choose the version you need:
+
+**Windows, no Python required: `imgterm.exe`**
+
+1. Download [`imgterm.exe`](https://github.com/Senju-Bardock/imgterm/raw/main/imgterm.exe).
+2. Open a terminal in the folder where you saved it and run:
+
+```bat
+imgterm.exe photo.png --width 60
+```
+
+Tip: put `imgterm.exe` in a folder that is in your `PATH` and you can run `imgterm photo.png` from anywhere.
+
+**Any system, with Python: `imgterm.py`**
+
+1. Download [`imgterm.py`](https://raw.githubusercontent.com/Senju-Bardock/imgterm/main/imgterm.py) and drop it next to your script (same folder).
+2. Import it as usual:
+
+```python
+from imgterm import show_image
+
+show_image("photo.png")
+```
+
+You can also run it directly: `python imgterm.py photo.png --width 60`
 
 ## Animated GIFs
 
