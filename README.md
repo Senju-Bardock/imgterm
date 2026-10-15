@@ -45,7 +45,7 @@ Tip: use a tag or a commit instead of `main` (`.../imgterm/v0.1.0/imgterm.py`) s
 
 ## Option 3: copy the file
 
-`imgterm.py` is a single file; just drop it next to your project.
+`imgterm.exe` is a single file; just install it. You can use also `imgterm.py` and drop it next to your project.
 
 ## Animated GIFs
 
