@@ -1,0 +1,8 @@
+# built native engine (rebuilt by pip / build_native.py / on first use)
+imgterm_native/*.so
+imgterm_native/*.dll
+imgterm_native/*.dylib
+build/
+dist/
+*.egg-info/
+__pycache__/

@@ -27,9 +27,15 @@ Usage from the terminal:
     python imgterm.py photo.png --folder visual --width 60 --mode sixel
     python imgterm.py dance.gif --loops 3
 
+Speed: there is an optional native engine written in C (imgterm_core.c) that does
+the heavy lifting (PNG/JPEG/GIF decoding, resizing, rendering). It is found next to
+this file, or compiled once with the C compiler of the machine; when it is not
+available everything runs in pure Python with the same output, only slower.
+
 Environment variables (optional):
-    IMGTERM_MODE   sixel | kitty | iterm2 | blocks   (skips auto-detection)
-    IMGTERM_CELL   WxH size of one character cell in pixels, e.g. 10x20
+    IMGTERM_MODE    sixel | kitty | iterm2 | blocks   (skips auto-detection)
+    IMGTERM_CELL    WxH size of one character cell in pixels, e.g. 10x20
+    IMGTERM_NATIVE  0 = never use the C engine (pure Python)
 """
 
 import argparse
@@ -50,7 +56,8 @@ from functools import lru_cache
 from itertools import accumulate, chain, count, groupby
 from pathlib import Path
 
-__all__ = ["show_image", "preload", "read_image", "read_gif", "read_png", "render", "detect_mode"]
+__all__ = ["show_image", "preload", "read_image", "read_gif", "read_png", "render", "detect_mode",
+           "native_available"]
 
 MODES = ("auto", "sixel", "kitty", "iterm2", "blocks")
 DEFAULT_CELL = (9, 18)  # pixels (width, height) of a character cell if unknown
@@ -204,6 +211,216 @@ def _truecolor():
 
 
 # ---------------------------------------------------------------------------
+# 1b. Native engine (optional): imgterm_core.c, loaded with ctypes
+#
+# Pictures travel through the native code as FLAT buffers: bytes of r,g,b,r,g,b...
+# row after row (width * height * 3). The pure Python code keeps using lists of
+# rows of (r, g, b) tuples. Both give exactly the same output.
+# ---------------------------------------------------------------------------
+_NATIVE = False  # False = not tried yet, None = not available, else the loaded library
+_NATIVE_WHY = "not loaded yet"
+_NATIVE_LOCK = threading.Lock()
+_NATIVE_ABI = 1
+
+
+def _lib_name():
+    if os.name == "nt":
+        return "imgterm_core.dll"
+    return "imgterm_core.dylib" if sys.platform == "darwin" else "imgterm_core.so"
+
+
+def _module_dir():
+    try:
+        return Path(__file__).resolve().parent
+    except NameError:  # exec()'d from a string (README option 2): nothing to look for
+        return None
+
+
+def _compile_native(source, target):
+    """Compile imgterm_core.c with whatever C compiler is installed. True on success."""
+    import shlex
+    import subprocess
+
+    flags = ["-O3", "-ffp-contract=off", "-std=c99", "-shared"] + ([] if os.name == "nt" else ["-fPIC"])
+    tmp = target.with_name("%s.%d.tmp" % (target.name, os.getpid()))
+    for name in (os.environ.get("CC"), "cc", "gcc", "clang"):
+        if not name:
+            continue
+        cmd = shlex.split(name)
+        exe = shutil.which(cmd[0])
+        if not exe:
+            continue
+        try:
+            done = subprocess.run([exe] + cmd[1:] + flags + ["-o", str(tmp), str(source), "-lm"],
+                                  capture_output=True, timeout=120)
+        except Exception:
+            continue
+        if done.returncode == 0 and tmp.exists():
+            os.replace(tmp, target)
+            return True
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    return False
+
+
+def _open_library(path):
+    import ctypes
+
+    lib = ctypes.CDLL(str(path))
+    if lib.imgterm_abi() != _NATIVE_ABI:
+        raise OSError("imgterm_core was built for another version of imgterm")
+    return lib
+
+
+def _find_native():
+    """Look for a built library next to this file; otherwise build it once (cached)."""
+    global _NATIVE_WHY
+    here = _module_dir()
+    if here is None:
+        _NATIVE_WHY = "running from a string, there is no file to look next to"
+        return None
+    name = _lib_name()
+    folders = [here, here / "imgterm_native"]
+    for folder in folders:
+        if (folder / name).is_file():
+            try:
+                return _open_library(folder / name)
+            except Exception as error:
+                _NATIVE_WHY = "could not load %s: %s" % (folder / name, error)
+    source = next((f / "imgterm_core.c" for f in folders if (f / "imgterm_core.c").is_file()), None)
+    if source is None:
+        _NATIVE_WHY = "%s not found (build it with: python build_native.py)" % name
+        return None
+    import hashlib
+    import platform
+
+    if os.name == "nt":
+        cache = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "imgterm"
+    else:
+        cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "imgterm"
+    tag = hashlib.sha1(source.read_bytes()).hexdigest()[:12]
+    target = cache / ("imgterm_core-%s-%s-%s%s" % (tag, sys.platform, platform.machine() or "any",
+                                                   Path(name).suffix))
+    failed = target.with_name(target.name + ".failed")
+    try:
+        if target.is_file():
+            return _open_library(target)
+        if failed.is_file() and time.time() - failed.stat().st_mtime < 86400:
+            _NATIVE_WHY = "no C compiler found the last time it was tried (retried once a day)"
+            return None
+        cache.mkdir(parents=True, exist_ok=True)
+        if _compile_native(source, target):
+            return _open_library(target)
+        failed.write_bytes(b"")
+        _NATIVE_WHY = "no working C compiler (cc, gcc or clang) to build imgterm_core.c"
+    except Exception as error:
+        _NATIVE_WHY = "could not build/load the native engine: %s" % error
+    return None
+
+
+def _bind(lib):
+    """Declare the C signatures and hand the lookup tables (computed here) to C."""
+    import ctypes as C
+
+    vp, i, st = C.c_void_p, C.c_int, C.c_size_t
+    pp = C.POINTER(C.c_void_p)
+    sig = {
+        "png_to_rgb": (i, [vp, st, i, i, i, i, i, vp, i, vp, vp, vp]),
+        "resize_init": (None, [vp, vp]),
+        "resize_rgb": (i, [vp, i, i, i, i, vp]),
+        "render_blocks": (i, [vp, i, i, i, pp, C.POINTER(st)]),
+        "render_sixel": (i, [vp, i, i, pp, C.POINTER(st)]),
+        "gif_lzw": (C.c_long, [vp, st, i, vp, st]),
+        "gif_fill": (None, [vp, i, i, i, i, i, i, i, i, i]),
+        "gif_draw": (None, [vp, i, i, vp, i, i, i, i, i, vp, i]),
+        "jpeg_huffman_table": (i, [vp, vp, i, vp]),
+        "jpeg_scan": (i, [vp, vp, i, i, i, vp, vp, i, i, i, i, i, i, i]),
+        "jpeg_output": (i, [vp, i, vp, i, i, i, i, i, i, vp, vp, vp, vp, vp, vp]),
+        "png_raw_rows": (None, [vp, i, i, vp]),
+        "imgterm_free": (None, [vp]),
+    }
+    for name, (res, args) in sig.items():
+        fn = getattr(lib, name)
+        fn.restype, fn.argtypes = res, args
+    to_linear = (C.c_double * 256)(*_TO_LINEAR)
+    from_linear = (C.c_ubyte * _N_LIN)(*_FROM_LINEAR)
+    lib.resize_init(to_linear, from_linear)
+
+
+def _native():
+    """The loaded C engine, or None. Loaded lazily (and once) on first use."""
+    global _NATIVE, _NATIVE_WHY
+    if _NATIVE is not False:
+        return _NATIVE
+    with _NATIVE_LOCK:
+        if _NATIVE is not False:
+            return _NATIVE
+        lib = None
+        if os.environ.get("IMGTERM_NATIVE", "").strip().lower() in ("0", "off", "no", "false"):
+            _NATIVE_WHY = "disabled with IMGTERM_NATIVE=0"
+        else:
+            try:
+                lib = _find_native()
+                if lib is not None:
+                    _bind(lib)
+                    _NATIVE_WHY = "ok"
+            except Exception as error:
+                lib = None
+                _NATIVE_WHY = "could not start the native engine: %s" % error
+        _NATIVE = lib
+        return lib
+
+
+def native_available():
+    """True when the C engine is in use (False = pure Python, slower, same output)."""
+    return _native() is not None
+
+
+def _flatten(rows):
+    """List of rows of (r, g, b) -> flat bytes."""
+    return bytes(chain.from_iterable(chain.from_iterable(rows)))
+
+
+def _unflatten(flat, width, height):
+    """Flat r,g,b bytes -> list of rows of (r, g, b) tuples."""
+    stride = width * 3
+    rows = []
+    for y in range(height):
+        line = flat[y * stride:(y + 1) * stride]
+        rows.append(list(zip(line[0::3], line[1::3], line[2::3])))
+    return rows
+
+
+def _as_flat(img):
+    """Anything a renderer may receive (flat buffer or list of rows) -> flat bytes."""
+    if isinstance(img, bytes):
+        return img
+    if isinstance(img, (bytearray, memoryview)):
+        return bytes(img)
+    return _flatten(img)
+
+
+def _out_buffer(n):
+    """A writable buffer of n bytes and a ctypes view of it (to hand to C)."""
+    import ctypes
+
+    data = bytearray(n)
+    return data, (ctypes.c_char * n).from_buffer(data)
+
+
+def _take_string(lib, ptr, size):
+    """Copy a malloc'ed C buffer into bytes and free it."""
+    import ctypes
+
+    try:
+        return ctypes.string_at(ptr.value, size.value)
+    finally:
+        lib.imgterm_free(ptr)
+
+
+# ---------------------------------------------------------------------------
 # 2. PNG decoder (zlib + struct only): all color types, 1-16 bit, tRNS, Adam7
 # ---------------------------------------------------------------------------
 _ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
@@ -347,8 +564,9 @@ def _row_to_rgb(line, width, channels, depth, color, palette, trns, bg):
     return px
 
 
-def _decode_png(data, background=(0, 0, 0)):
-    """Returns (width, height, rows) with rows = list of lists of (r, g, b)."""
+def _decode_png(data, background=(0, 0, 0), flat=False):
+    """Returns (width, height, rows) with rows = list of lists of (r, g, b).
+    With flat=True (and the C engine available) 'rows' is a flat bytes buffer instead."""
     if data[:8] != b"\x89PNG\r\n\x1a\n":
         raise ValueError("The file is not a valid PNG.")
 
@@ -399,6 +617,25 @@ def _decode_png(data, background=(0, 0, 0)):
         palette, trns = blended, None
 
     raw = zlib.decompress(bytes(idat))
+
+    lib = _native()
+    if lib is not None:
+        import ctypes
+
+        pal = bytearray(768)
+        if palette:
+            pal[:3 * min(256, len(palette))] = bytes(chain.from_iterable(palette[:256]))
+        key = [0, 0, 0]
+        if trns is not None:
+            key = list(trns) if isinstance(trns, tuple) else [trns, 0, 0]
+        out, ptr = _out_buffer(width * height * 3)
+        status = lib.png_to_rgb(raw, len(raw), width, height, depth, color, interlaced, bytes(pal),
+                                1 if trns is not None else 0, (ctypes.c_int * 3)(*key),
+                                (ctypes.c_int * 3)(*background), ptr)
+        if status:
+            raise ValueError("Corrupt PNG data (it ends too early).")
+        out = bytes(out)
+        return width, height, (out if flat else _unflatten(out, width, height))
 
     if not interlaced:
         lines, _ = _unfilter(raw, 0, width, height, bits_pixel)
@@ -459,7 +696,7 @@ _IDCT_SMALL = {2: _idct_matrix(2), 4: _idct_matrix(4)}
 
 
 class _Component:
-    __slots__ = ("id", "h", "v", "tq", "bw", "bh", "bwm", "bhm", "coef", "pred", "dc", "ac")
+    __slots__ = ("id", "h", "v", "tq", "bw", "bh", "bwm", "bhm", "coef", "pred", "dc", "ac", "idx")
 
 
 def _huffman_table(counts, symbols):
@@ -779,9 +1016,36 @@ def _jpeg_upsample(plane, comp, hmax, vmax, out_w, out_h):
     return out
 
 
-def _decode_jpeg(data, box=None):
+def _jpeg_structs():
+    """ctypes mirror of the C structs used by the native JPEG code (built once)."""
+    global _JPEG_C
+    if _JPEG_C is None:
+        import ctypes as C
+
+        class JComp(C.Structure):
+            _fields_ = [("h", C.c_int), ("v", C.c_int), ("bw", C.c_int), ("bh", C.c_int),
+                        ("bwm", C.c_int), ("bhm", C.c_int), ("coef", C.c_void_p), ("pred", C.c_int),
+                        ("dc", C.c_void_p), ("ac", C.c_void_p)]
+
+        class JConst(C.Structure):
+            _fields_ = [("K", C.c_double * 8), ("m2", C.c_double * 4), ("m4", C.c_double * 16)]
+
+        const = JConst()
+        const.K[:] = [0.0, _K1, _K2, _K3, _K4, _K5, _K6, _K7]
+        const.m2[:] = [v for row in _IDCT_SMALL[2] for v in row]
+        const.m4[:] = [v for row in _IDCT_SMALL[4] for v in row]
+        tables = [(C.c_int * 256)(*t) for t in (_CR_R, _CB_B, _CB_G, _CR_G)]
+        _JPEG_C = (JComp, const, tables)
+    return _JPEG_C
+
+
+_JPEG_C = None
+
+
+def _decode_jpeg(data, box=None, flat=False):
     """
-    Returns (width, height, rows) with rows = list of lists of (r, g, b).
+    Returns (width, height, rows) with rows = list of lists of (r, g, b)
+    (a flat bytes buffer instead when flat=True and the C engine is available).
 
     box: optional (pixels wide, pixels high) the picture will be drawn in. A big
     photo is then decoded at 1/2, 1/4 or 1/8 size (using only the low frequencies
@@ -790,7 +1054,11 @@ def _decode_jpeg(data, box=None):
     if data[:2] != b"\xff\xd8":
         raise ValueError("The file is not a valid JPEG.")
 
+    lib = _native()
+    if lib is not None:
+        import ctypes
     qts, dc_tabs, ac_tabs = {}, {}, {}
+    cstructs = None
     comps = None
     progressive = False
     ri = 0
@@ -835,7 +1103,12 @@ def _decode_jpeg(data, box=None):
                 tc, th = body[i] >> 4, body[i] & 15
                 counts = body[i + 1:i + 17]
                 total = sum(counts)
-                table = _huffman_table(counts, body[i + 17:i + 17 + total])
+                if lib is not None:
+                    table = (ctypes.c_uint16 * 65536)()
+                    if lib.jpeg_huffman_table(bytes(counts), bytes(body[i + 17:i + 17 + total]), total, table):
+                        raise ValueError("Corrupt Huffman table.")
+                else:
+                    table = _huffman_table(counts, body[i + 17:i + 17 + total])
                 (ac_tabs if tc else dc_tabs)[th] = table
                 i += 17 + total
         elif marker in (0xC0, 0xC1, 0xC2):  # start of frame
@@ -857,6 +1130,7 @@ def _decode_jpeg(data, box=None):
                 comp.h, comp.v = body[7 + 3 * i] >> 4, body[7 + 3 * i] & 15
                 comp.tq = body[8 + 3 * i]
                 comp.pred = 0
+                comp.idx = i
                 comp.dc = comp.ac = None
                 if not (1 <= comp.h <= 4 and 1 <= comp.v <= 4):
                     raise ValueError("Invalid JPEG sampling factors.")
@@ -871,6 +1145,13 @@ def _decode_jpeg(data, box=None):
                 comp.bwm = mcus_x * comp.h
                 comp.bhm = mcus_y * comp.v
                 comp.coef = array("h", [0]) * (comp.bwm * comp.bhm * 64)
+            if lib is not None:
+                JComp = _jpeg_structs()[0]
+                cstructs = (JComp * count)()
+                for comp in comps:
+                    cs = cstructs[comp.idx]
+                    cs.h, cs.v, cs.bw, cs.bh, cs.bwm, cs.bhm = comp.h, comp.v, comp.bw, comp.bh, comp.bwm, comp.bhm
+                    cs.coef = comp.coef.buffer_info()[0]
         elif marker in _JPEG_UNSUPPORTED:
             raise ValueError("This kind of JPEG is not supported (arithmetic coding, "
                              "lossless or hierarchical).")
@@ -894,8 +1175,21 @@ def _decode_jpeg(data, box=None):
             end = found.start() if found else size
             chunks = [c.replace(b"\xff\x00", b"\xff")
                       for c in _JPEG_RESTART.split(data[pos:end])]
-            _jpeg_scan(chunks, mcus_x, mcus_y, scomps, ri, progressive,
-                       ss, se, successive >> 4, successive & 15)
+            if lib is not None:
+                for comp in scomps:
+                    cs = cstructs[comp.idx]
+                    cs.dc = ctypes.addressof(comp.dc) if comp.dc is not None else None
+                    cs.ac = ctypes.addressof(comp.ac) if comp.ac is not None else None
+                status = lib.jpeg_scan(b"".join(chunks), (ctypes.c_int * len(chunks))(*map(len, chunks)),
+                                       len(chunks), mcus_x, mcus_y, cstructs,
+                                       (ctypes.c_int * len(scomps))(*[c.idx for c in scomps]),
+                                       len(scomps), ri, int(progressive), ss, se,
+                                       successive >> 4, successive & 15)
+                if status:
+                    raise ValueError("Corrupt JPEG data.")
+            else:
+                _jpeg_scan(chunks, mcus_x, mcus_y, scomps, ri, progressive,
+                           ss, se, successive >> 4, successive & 15)
             pos = end
 
     if comps is None:
@@ -910,6 +1204,24 @@ def _decode_jpeg(data, box=None):
                 break
     out_w = -(-width * n // 8)
     out_h = -(-height * n // 8)
+
+    if lib is not None:
+        _, const, color_tables = _jpeg_structs()
+        qt_all = (ctypes.c_int * (64 * len(comps)))()
+        for k, comp in enumerate(comps):
+            qt_all[64 * k:64 * k + 64] = qts[comp.tq]
+        if len(comps) == 1:
+            mode = 0
+        elif adobe == 0 or tuple(c.id for c in comps) == (82, 71, 66):  # stored as plain RGB
+            mode = 1
+        else:
+            mode = 2
+        out, ptr = _out_buffer(out_w * out_h * 3)
+        if lib.jpeg_output(cstructs, len(comps), qt_all, n, out_w, out_h, hmax, vmax, mode,
+                           ctypes.byref(const), *color_tables, ptr):
+            raise ValueError("Corrupt JPEG data.")
+        out = bytes(out)
+        return out_w, out_h, (out if flat else _unflatten(out, out_w, out_h))
 
     ups = [_jpeg_upsample(_jpeg_plane(comp, qts[comp.tq], n), comp, hmax, vmax, out_w, out_h)
            for comp in comps]
@@ -1015,7 +1327,7 @@ def _gif_fill(canvas, rect, color):
         canvas[y] = row
 
 
-def _decode_gif(data, background=(0, 0, 0)):
+def _decode_gif(data, background=(0, 0, 0), flat=False):
     """
     Returns (width, height, info, frames).
 
@@ -1023,6 +1335,7 @@ def _decode_gif(data, background=(0, 0, 0)):
     picture (previous frames, transparency and disposal methods already applied)
     as a list of lists of (r, g, b); treat it as read-only, rows are shared
     between frames. Decoding is lazy: a frame is only decoded when it is asked for.
+    With flat=True (and the C engine available) 'rows' is a flat bytes buffer instead.
 
     info["loops"]: None = the file has no loop extension (play once),
                    0 = loop forever, n = repeat n more times.
@@ -1042,9 +1355,16 @@ def _decode_gif(data, background=(0, 0, 0)):
         pos += n
     info = {"loops": None}
     bg = tuple(background)
+    lib = _native()
+    if lib is not None:
+        import ctypes
 
     def frames(pos):
-        canvas = [[bg] * width for _ in range(height)]
+        if lib is not None:
+            canvas = bytearray(bytes(bg) * (width * height))
+            canvas_c = (ctypes.c_char * len(canvas)).from_buffer(canvas)
+        else:
+            canvas = [[bg] * width for _ in range(height)]
         size = len(data)
         disposal = delay = 0  # of the NEXT image, set by the graphic control extension
         trans = None
@@ -1086,6 +1406,38 @@ def _decode_gif(data, background=(0, 0, 0)):
                     raise ValueError("Corrupt GIF data.")
                 body, pos = _gif_subblocks(data, pos)
                 need = fw * fh
+                if lib is not None:
+                    idx = bytearray(need)
+                    made = lib.gif_lzw(body, len(body), min_code, (ctypes.c_char * need).from_buffer(idx)
+                                       if need else None, need)
+                    if made < 0:
+                        raise ValueError("Corrupt GIF data.")
+                    idx = bytes(idx)
+                    pal_bytes = bytes(chain.from_iterable(palette[:256]))
+                    pal_bytes += bytes(768 - len(pal_bytes))
+
+                    # 1) undo what the previous frame asked for
+                    if prev_disposal == 2 and prev_rect:
+                        lib.gif_fill(canvas_c, width, height, *prev_rect, *bg)
+                    elif prev_disposal == 3 and saved is not None:
+                        canvas[:] = saved
+                    saved = bytes(canvas) if disposal == 3 else None
+
+                    # 2) draw this frame
+                    lib.gif_draw(canvas_c, width, height, idx, left, top, fw, fh, 1 if fl & 0x40 else 0,
+                                 pal_bytes, -1 if trans is None else trans)
+                    x0, x1 = left, min(left + fw, width)
+                    y1 = min(top + fh, height)
+                    seconds = delay / 100
+                    if seconds < 0.02:
+                        seconds = 0.1
+                    prev_disposal, prev_rect = disposal, (x0, top, x1, y1)
+                    disposal = delay = 0
+                    trans = None
+                    produced += 1
+                    picture = bytes(canvas)
+                    yield (picture if flat else _unflatten(picture, width, height)), seconds
+                    continue
                 idx = _gif_lzw(body, min_code, need)
                 if len(idx) < need:
                     idx += bytes(need - len(idx))
@@ -1140,20 +1492,20 @@ def _decode_gif(data, background=(0, 0, 0)):
     return width, height, info, frames(pos)
 
 
-def _decode_image(data, background=(0, 0, 0), box=None):
+def _decode_image(data, background=(0, 0, 0), box=None, flat=False):
     """Decode PNG, JPEG or GIF bytes (detected from the first bytes, not from the name).
-    For an animated GIF this returns the first frame."""
+    For an animated GIF this returns the first frame. flat=True: see _decode_png."""
     if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return _decode_png(data, background)
+        return _decode_png(data, background, flat)
     if data[:2] == b"\xff\xd8":
         try:
-            return _decode_jpeg(data, box)
+            return _decode_jpeg(data, box, flat)
         except ValueError:
             raise
         except Exception as error:
             raise ValueError("Corrupt or unsupported JPEG.") from error
     if data[:6] in _GIF_MAGIC:
-        width, height, _, frames = _decode_gif(data, background)
+        width, height, _, frames = _decode_gif(data, background, flat)
         return width, height, next(frames)[0]
     raise ValueError("Unsupported image format (only PNG, JPEG and GIF).")
 
@@ -1247,8 +1599,16 @@ def _mix(vectors, taps_list):
 
 
 def _resize(rows, width, height, new_w, new_h):
+    """Resize; returns the same kind of picture it received (rows or flat bytes).
+    With the C engine the result is always flat bytes."""
     if (new_w, new_h) == (width, height):
         return rows
+    lib = _native()
+    if lib is not None:
+        out, ptr = _out_buffer(new_w * new_h * 3)
+        if lib.resize_rgb(_as_flat(rows), width, height, new_w, new_h, ptr):
+            raise MemoryError("not enough memory to resize the image")
+        return bytes(out)
     wy = _weights(height, new_h)
     wx = _weights(width, new_w)
 
@@ -1349,6 +1709,14 @@ def _sgr(base, rgb, truecolor):
 
 
 def _render_blocks(img, w, h, truecolor):
+    lib = _native()
+    if lib is not None:
+        import ctypes
+
+        ptr, size = ctypes.c_void_p(), ctypes.c_size_t()
+        if lib.render_blocks(_as_flat(img), w, h, int(truecolor), ctypes.byref(ptr), ctypes.byref(size)):
+            raise MemoryError("not enough memory to draw the image")
+        return _take_string(lib, ptr, size).decode("utf-8")
     lines = []
     for y in range(0, h, 2):
         top, bottom = img[y], img[y + 1]
@@ -1447,6 +1815,14 @@ def _rle(arr):
 
 
 def _render_sixel(img, w, h):
+    lib = _native()
+    if lib is not None:
+        import ctypes
+
+        ptr, size = ctypes.c_void_p(), ctypes.c_size_t()
+        if lib.render_sixel(_as_flat(img), w, h, ctypes.byref(ptr), ctypes.byref(size)):
+            raise MemoryError("not enough memory to draw the image")
+        return _take_string(lib, ptr, size).decode("ascii")
     palette, idx = _quantize(img)
     out = ['\x1bP0;1;0q"1;1;%d;%d' % (w, h)]
     for i, (r, g, b) in enumerate(palette):
@@ -1472,10 +1848,16 @@ def _render_sixel(img, w, h):
 # 4c. Renderers "kitty" and "iterm2": the terminal draws a real PNG
 # ---------------------------------------------------------------------------
 def _encode_png(img, w, h):
-    raw = bytearray()
-    for row in img:
-        raw.append(0)
-        raw += bytes(chain.from_iterable(row))
+    lib = _native()
+    if lib is not None:
+        raw, ptr = _out_buffer(h * (w * 3 + 1))
+        lib.png_raw_rows(_as_flat(img), w, h, ptr)
+        raw = bytes(raw)
+    else:
+        raw = bytearray()
+        for row in img:
+            raw.append(0)
+            raw += bytes(chain.from_iterable(row))
 
     def chunk(kind, body):
         return (struct.pack(">I", len(body)) + kind + body
@@ -1483,7 +1865,7 @@ def _encode_png(img, w, h):
 
     return (b"\x89PNG\r\n\x1a\n"
             + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+            + chunk(b"IDAT", zlib.compress(raw, 6))
             + chunk(b"IEND", b""))
 
 
@@ -1610,7 +1992,7 @@ class _Animation:
     MARGIN = 1.3  # safety factor over the measured render time per frame
 
     def __init__(self, data, background, max_width, max_height, mode, cell, size):
-        self.width, self.height, self.info, self._frames = _decode_gif(data, background)
+        self.width, self.height, self.info, self._frames = _decode_gif(data, background, flat=True)
         caps = _terminal_caps()  # detected here, in the caller's thread
         self.mode = caps["mode"] if mode in (None, "auto") else mode
         if self.mode not in MODES[1:]:
@@ -1837,7 +2219,7 @@ def _cached_output(key, source, max_width, max_height, mode, background, cell, s
             if data[:6] in _GIF_MAGIC:  # animation: frames are rendered on demand
                 output = _Animation(data, background, max_width, max_height, mode, cell, size)
             else:
-                width, height, rows = _decode_image(data, background, box)
+                width, height, rows = _decode_image(data, background, box, flat=True)
                 output = render(width, height, rows, max_width, max_height, mode, cell,
                                 _term_size=size)
             with _LOCK:
@@ -1937,7 +2319,16 @@ def _parse_color(text):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Show a PNG, JPEG or GIF in the terminal.")
+    if argv is None:
+        argv = sys.argv[1:]
+    if list(argv) == ["--info"]:  # which engine is running?
+        if native_available():
+            print("imgterm engine: native (C)")
+        else:
+            print("imgterm engine: pure Python (%s)" % _NATIVE_WHY)
+        return
+    parser = argparse.ArgumentParser(description="Show a PNG, JPEG or GIF in the terminal. "
+                                                 "(imgterm --info tells which engine is in use.)")
     parser.add_argument("image", help="path or URL of the PNG, JPEG or GIF")
     parser.add_argument("-f", "--folder", help="folder where the image is searched")
     parser.add_argument("-w", "--width", type=int, help="maximum width in columns")

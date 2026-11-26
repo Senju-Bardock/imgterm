@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "imgterm"
-version = "1.0.0"
-description = "Display PNG, JPEG and animated GIF images in the terminal with no external dependencies"
+version = "1.1.0"
+description = "Display PNG, JPEG and animated GIF images in the terminal with no external dependencies (optional C engine for speed)"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = []
@@ -15,3 +15,7 @@ imgterm = "imgterm:main"
 
 [tool.setuptools]
 py-modules = ["imgterm"]
+packages = ["imgterm_native"]
+
+[tool.setuptools.package-data]
+imgterm_native = ["*.c"]

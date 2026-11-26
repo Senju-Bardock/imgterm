@@ -2,6 +2,8 @@
 
 Display PNG, JPEG and animated GIF images in the terminal (Windows, Linux, macOS) using **only the Python standard library**. No dependencies.
 
+**New in 1.1.0: an optional engine written in C** that does the heavy lifting (decoding, resizing, drawing). It makes images and GIFs show up roughly **6x to 100x faster** (usually 20x or more for big images and GIFs) and gives exactly the same output as pure Python. If it is not available, `imgterm` silently keeps working in pure Python. See [Native engine (C)](#native-engine-c).
+
 ## Installation
 
 There are three ways to use `imgterm`. Pick the one that fits you:
@@ -13,7 +15,7 @@ There are three ways to use `imgterm`. Pick the one that fits you:
 | **Needs internet** | Only once, to install | Every time the script runs | Only once, to download |
 | **Adds the `imgterm` command** | Yes | No | `imgterm.exe` is the command itself |
 
-No matter which option you choose, `imgterm` has **no dependencies**: only the Python standard library.
+No matter which option you choose, `imgterm` has **no dependencies**: only the Python standard library (the C engine is optional and needs nothing but a C compiler, see below).
 
 ### Option 1: install with pip (recommended)
 
@@ -50,7 +52,7 @@ To update it later: `pip install --upgrade git+https://github.com/Senju-Bardock/
 
 ### Option 2: no install, no download
 
-Nothing is installed on your computer. Paste this at the top of your script and it loads the module into memory from GitHub every time it runs (**needs internet**):
+Nothing is installed on your computer. Paste this at the top of your script and it loads the module into memory from GitHub every time it runs (**needs internet**). This way there is no file to put the C engine next to, so it runs in pure Python:
 
 ```python
 import types, urllib.request
@@ -92,6 +94,49 @@ show_image("photo.png")
 
 You can also run it directly: `python imgterm.py photo.png --width 60`
 
+To use the C engine with this option, copy the `imgterm_native` folder (it only needs `imgterm_core.c`) next to `imgterm.py` too.
+
+## Native engine (C)
+
+`imgterm_native/imgterm_core.c` is a port of the hot code of `imgterm.py` to plain C (no libraries besides libc/libm): PNG unfiltering, the JPEG decoder (Huffman, IDCT, color conversion), GIF LZW and frame composition, the gamma-correct resizer, the `blocks` renderer and the sixel quantizer/encoder. Python still does the parsing, the terminal detection and the animation player; it calls the C code through `ctypes`, so **there is still nothing to `pip install`** and the Python API does not change.
+
+`imgterm` looks for the engine in this order, the first time it needs it:
+
+1. A built library next to `imgterm.py` (`imgterm_native/imgterm_core.so`, `.dll` on Windows, `.dylib` on macOS). `pip install` builds it for you.
+2. If there is none but the `.c` file is there and the machine has a C compiler (`cc`, `gcc` or `clang`, or the one in `$CC`), it is compiled **once** (about a second) into a cache folder (`~/.cache/imgterm`, `%LOCALAPPDATA%\imgterm` on Windows) and reused from then on.
+3. Otherwise: pure Python. Nothing breaks, it is only slower.
+
+```bash
+imgterm --info                     # which engine is running?
+python build_native.py             # build it by hand (next to imgterm.py)
+IMGTERM_NATIVE=0 imgterm photo.png # force pure Python (also useful to compare)
+python benchmark.py photo.png dance.gif   # C engine vs Python on your own images
+```
+
+```python
+import imgterm
+imgterm.native_available()   # True when the C engine is in use
+```
+
+The output is **identical** to the pure Python one (same pixels, same escape sequences): the C code does the floating point maths in the same order as the Python code, and the test images (all PNG color types and bit depths, interlaced, baseline and progressive JPEG with every chroma subsampling, GIFs with transparency and every disposal method) are compared byte by byte against the Python output. The decoders were also fuzzed (truncated and corrupted files) under AddressSanitizer/UBSan: a damaged image gives the usual "could not be read" message, never a crash.
+
+Measured time to decode + draw (first time, 120x40 terminal, 2 vCPU Linux container; your numbers will differ):
+
+| Image | Renderer | Python | C engine | Speedup |
+| --- | --- | ---: | ---: | ---: |
+| PNG 1600x1000 RGB | blocks | 750 ms | 30 ms | 25x |
+| PNG 1600x1000 RGB | sixel | 3156 ms | 76 ms | 42x |
+| PNG 1600x1000 RGB | kitty | 2346 ms | 106 ms | 22x |
+| JPEG 1600x1000 | blocks | 1956 ms | 35 ms | 56x |
+| JPEG progressive 1600x1000 | sixel | 5668 ms | 101 ms | 56x |
+| GIF 320x240, 40 frames | blocks | 1678 ms | 29 ms | 59x |
+| GIF 320x240, 40 frames | sixel | 20519 ms | 250 ms | 82x |
+| PNG 288x288 | blocks | 152 ms | 3 ms | 51x |
+
+What is left in the C-engine times is mostly `zlib` (inflating the PNG, deflating the PNG that kitty/iTerm2 receive), which already is C.
+
+**Windows.** `pip install` and `python build_native.py` need a C compiler there (MSVC through "Build Tools for Visual Studio", or MinGW `gcc`). The prebuilt `imgterm.exe` is a frozen copy of the Python code: it only gets the C engine when it is rebuilt with `imgterm_core.dll` included.
+
 ## Animated GIFs
 
 `show_image("dance.gif")` plays the animation in place, with the GIF's own frame timing, on every renderer (sixel, kitty, iterm2 and blocks). `loops=None` (default) follows the file: no loop extension = once, "forever" = until you press **Ctrl+C** (the cursor is left right below the picture). Use `loops=1`, `2`... to play a fixed number of times, or `loops=0` to force forever. A GIF with a single frame is drawn like a PNG, and when the output is not a terminal (redirected to a file or pipe) only the first frame is printed.
@@ -102,7 +147,7 @@ Since 0.5.0 a GIF is smooth **from the first frame to the last**. A background t
 
 ## Speed: caching and preload
 
-Decoding a PNG in pure Python takes a moment (roughly proportional to the number of pixels). `imgterm` keeps every rendered image in memory, so **showing the same image again is practically instant** (about 0.2 ms, identical output). The first time can be hidden by decoding in the background at startup:
+Decoding a PNG in pure Python takes a moment (roughly proportional to the number of pixels); with the [C engine](#native-engine-c) it is many times faster. `imgterm` keeps every rendered image in memory, so **showing the same image again is practically instant** (about 0.2 ms, identical output). The first time can be hidden by decoding in the background at startup:
 
 ```python
 from imgterm import show_image, preload
@@ -134,6 +179,7 @@ python example.py path/to/your_image.png
 | `read_gif(source, background=(0, 0, 0))` | Decodes every frame of a GIF: `(width, height, frames, loops)` with `frames = [(rows, delay_seconds), ...]` (each one is the complete picture) |
 | `read_png(source)` | Same as `read_image` (kept for backwards compatibility) |
 | `render(width, height, rows, max_width=None, max_height=None)` | Returns the ANSI string, ready to print |
+| `native_available()` | `True` when the C engine is in use, `False` for pure Python |
 
 ## Limitations
 
