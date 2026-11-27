@@ -2,6 +2,8 @@
 
 Display PNG, JPEG and animated GIF images in the terminal (Windows, Linux, macOS) using **only the Python standard library**. No dependencies.
 
+**New in 1.2.0:** photos from phones are shown upright (EXIF orientation), images can be piped in (`curl -s URL | imgterm -`) and there is `imgterm --version`.
+
 **New in 1.1.0: an optional engine written in C** that does the heavy lifting (decoding, resizing, drawing). It makes images and GIFs show up roughly **6x to 100x faster** (usually 20x or more for big images and GIFs) and gives exactly the same output as pure Python. If it is not available, `imgterm` silently keeps working in pure Python. See [Native engine (C)](#native-engine-c).
 
 ## Installation
@@ -44,7 +46,11 @@ Or from the terminal:
 ```bash
 imgterm photo.png --width 60
 imgterm dance.gif --loops 3
+curl -s https://example.com/image.png | imgterm -    # "-" reads the image from standard input
+imgterm --version
 ```
+
+With `-` the format is detected from the file's first bytes, so no extension is needed. From Python, `show_image(data)` and `read_image(data)` also accept the bytes of an image. On Windows, when the image arrives through a pipe the terminal cannot be asked whether it supports sixel, so add `--mode sixel` if you want it (kitty, iTerm2 and `blocks` need nothing).
 
 To update it later: `pip install --upgrade git+https://github.com/Senju-Bardock/imgterm.git`
 

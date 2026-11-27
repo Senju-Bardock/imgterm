@@ -21,11 +21,14 @@ Usage as a module:
     show_image("https://site.com/image.png")        # URLs work too
     show_image("photo.png", max_width=60)           # limit width (columns)
     show_image("photo.png", mode="blocks")          # force a renderer
+    show_image(image_bytes)                         # the bytes of a PNG/JPEG/GIF you already have
 
 Usage from the terminal:
     python imgterm.py photo.png
     python imgterm.py photo.png --folder visual --width 60 --mode sixel
     python imgterm.py dance.gif --loops 3
+    curl -s https://site.com/image.png | python imgterm.py -    # "-" reads the image from stdin
+    python imgterm.py --version
 
 Speed: there is an optional native engine written in C (imgterm_core.c) that does
 the heavy lifting (PNG/JPEG/GIF decoding, resizing, rendering). It is found next to
@@ -55,6 +58,8 @@ from array import array
 from functools import lru_cache
 from itertools import accumulate, chain, count, groupby
 from pathlib import Path
+
+__version__ = "1.2.0"
 
 __all__ = ["show_image", "preload", "read_image", "read_gif", "read_png", "render", "detect_mode",
            "native_available"]
@@ -98,7 +103,13 @@ def _query_terminal(timeout=0.5):
     Returns (supports_sixel, (cell_w, cell_h) or None).
     """
     try:
-        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        if not sys.stdout.isatty():
+            return False, None
+        # With a pipe on stdin (curl ... | imgterm -) the reply can still be read from
+        # the controlling terminal on Linux/macOS; on Windows there is no safe way, so
+        # auto-detection of sixel is skipped there (use --mode).
+        own_tty = not sys.stdin.isatty()
+        if own_tty and os.name == "nt":
             return False, None
     except Exception:
         return False, None
@@ -137,8 +148,13 @@ def _query_terminal(timeout=0.5):
             import termios
             import tty
 
-            fd = sys.stdin.fileno()
-            saved = termios.tcgetattr(fd)
+            fd = os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY) if own_tty else sys.stdin.fileno()
+            try:
+                saved = termios.tcgetattr(fd)
+            except Exception:
+                if own_tty:
+                    os.close(fd)
+                raise
             try:
                 tty.setcbreak(fd)
                 sys.stdout.write(query)
@@ -151,6 +167,8 @@ def _query_terminal(timeout=0.5):
             finally:
                 termios.tcsetattr(fd, termios.TCSADRAIN, saved)
                 termios.tcflush(fd, termios.TCIFLUSH)
+                if own_tty:
+                    os.close(fd)
     except Exception:
         return False, None
 
@@ -1576,7 +1594,9 @@ def _decode_image(data, background=(0, 0, 0), box=None, flat=False):
 
 
 def _read_bytes(source):
-    """Contents of a file path or http(s) URL."""
+    """Contents of a file path, an http(s) URL, or the bytes themselves."""
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        return bytes(source)
     source = str(source)
     if source.startswith(("http://", "https://")):
         with urllib.request.urlopen(source, timeout=15) as response:
@@ -2236,8 +2256,20 @@ def _animate(anim, loops=None, smooth=True):
 
 
 def _resolve(path, folder):
-    """Return (source, error_message). source is a Path or a URL string."""
+    """Return (source, error_message). source is a Path, a URL string, or bytes (stdin / bytes given)."""
+    if isinstance(path, (bytes, bytearray, memoryview)):  # the image itself, already in memory
+        return bytes(path), None
     path = str(path)
+    if path == "-":  # standard input: curl -s URL | imgterm -
+        try:
+            if sys.stdin is None or sys.stdin.isatty():
+                return None, "Nothing to read: pipe an image into imgterm, e.g.  curl -s URL | imgterm -"
+            data = sys.stdin.buffer.read()
+        except Exception as error:
+            return None, f"Could not read the image from standard input: {error}"
+        if not data:
+            return None, "Nothing was received on standard input (empty input)."
+        return data, None
     if path.startswith(("http://", "https://")):
         return path, None
     target = Path(path).expanduser()
@@ -2256,6 +2288,9 @@ def _make_key(source, max_width, max_height, mode, background, cell):
     if isinstance(source, Path):
         st = source.stat()
         ident = (str(source.resolve()), st.st_mtime_ns, st.st_size)  # reload if the file changes
+    elif isinstance(source, bytes):
+        import hashlib
+        ident = ("bytes", len(source), hashlib.sha1(source).hexdigest())
     else:
         ident = (source,)
     size = tuple(shutil.get_terminal_size((80, 24)))
@@ -2303,7 +2338,8 @@ def show_image(path, folder=None, max_width=None, max_height=None, mode="auto", 
     """
     Draw a PNG, JPEG or GIF image in the terminal. GIFs are animated in place.
 
-    path:        path (relative or absolute) or URL of the image.
+    path:        path (relative or absolute) or URL of the image; "-" reads it from
+                 standard input; the bytes of an image are accepted too.
     folder:      folder to search in if 'path' is relative (optional).
     max_width:   maximum width in columns (optional).
     max_height:  maximum height in text lines (optional).
@@ -2394,7 +2430,8 @@ def main(argv=None):
         return
     parser = argparse.ArgumentParser(description="Show a PNG, JPEG or GIF in the terminal. "
                                                  "(imgterm --info tells which engine is in use.)")
-    parser.add_argument("image", help="path or URL of the PNG, JPEG or GIF")
+    parser.add_argument("image", help="path or URL of the PNG, JPEG or GIF; use - to read it from stdin")
+    parser.add_argument("-V", "--version", action="version", version="imgterm " + __version__)
     parser.add_argument("-f", "--folder", help="folder where the image is searched")
     parser.add_argument("-w", "--width", type=int, help="maximum width in columns")
     parser.add_argument("-H", "--height", type=int, help="maximum height in lines")
