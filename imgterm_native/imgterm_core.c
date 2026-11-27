@@ -31,7 +31,7 @@
 #  define EXPORT
 #endif
 
-#define IMGTERM_ABI 1
+#define IMGTERM_ABI 2
 
 EXPORT int imgterm_abi(void) { return IMGTERM_ABI; }
 EXPORT void imgterm_free(void *p) { free(p); }
@@ -1167,4 +1167,34 @@ EXPORT void png_raw_rows(const uint8_t *rgb, int w, int h, uint8_t *out) {
         out[(size_t)y * (stride + 1)] = 0;
         memcpy(out + (size_t)y * (stride + 1) + 1, rgb + (size_t)y * stride, stride);
     }
+}
+
+/* ------------------------------------------------------------------------- */
+/* 8. EXIF orientation: move pixels so the picture is shown upright          */
+/* ------------------------------------------------------------------------- */
+/*
+ * o is the EXIF orientation (2..8; 1 would be a plain copy). The output is h x w
+ * for 5..8 (turned a quarter) and w x h otherwise. Pure pixel moves, so the result
+ * is identical to the pure Python code in _apply_orientation().
+ */
+EXPORT int orient_rgb(const uint8_t *in, int w, int h, int o, uint8_t *out) {
+    if (o < 1 || o > 8) return -1;
+    int dw = o >= 5 ? h : w, dh = o >= 5 ? w : h;
+    for (int y = 0; y < dh; y++) {
+        for (int x = 0; x < dw; x++) {
+            int sx, sy;
+            switch (o) {
+            case 1: sx = x;         sy = y;         break;
+            case 2: sx = w - 1 - x; sy = y;         break;
+            case 3: sx = w - 1 - x; sy = h - 1 - y; break;
+            case 4: sx = x;         sy = h - 1 - y; break;
+            case 5: sx = y;         sy = x;         break;
+            case 6: sx = y;         sy = h - 1 - x; break;
+            case 7: sx = w - 1 - y; sy = h - 1 - x; break;
+            default: sx = w - 1 - y; sy = x;        break;
+            }
+            memcpy(out + ((size_t)y * dw + x) * 3, in + ((size_t)sy * w + sx) * 3, 3);
+        }
+    }
+    return 0;
 }

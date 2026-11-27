@@ -220,7 +220,7 @@ def _truecolor():
 _NATIVE = False  # False = not tried yet, None = not available, else the loaded library
 _NATIVE_WHY = "not loaded yet"
 _NATIVE_LOCK = threading.Lock()
-_NATIVE_ABI = 1
+_NATIVE_ABI = 2
 
 
 def _lib_name():
@@ -339,6 +339,7 @@ def _bind(lib):
         "jpeg_scan": (i, [vp, vp, i, i, i, vp, vp, i, i, i, i, i, i, i]),
         "jpeg_output": (i, [vp, i, vp, i, i, i, i, i, i, vp, vp, vp, vp, vp, vp]),
         "png_raw_rows": (None, [vp, i, i, vp]),
+        "orient_rgb": (i, [vp, i, i, i, vp]),
         "imgterm_free": (None, [vp]),
     }
     for name, (res, args) in sig.items():
@@ -1492,6 +1493,67 @@ def _decode_gif(data, background=(0, 0, 0), flat=False):
     return width, height, info, frames(pos)
 
 
+def _jpeg_orientation(data):
+    """EXIF orientation (1-8) of a JPEG; 1 (upright) when there is none or it is unreadable."""
+    try:
+        pos, size = 2, len(data)
+        while pos + 4 <= size and data[pos] == 0xFF:
+            marker = data[pos + 1]
+            if marker == 0xFF:  # fill byte
+                pos += 1
+                continue
+            if marker == 0x01 or 0xD0 <= marker <= 0xD8:  # no payload
+                pos += 2
+                continue
+            if marker in (0xD9, 0xDA):  # end of image / start of scan: no EXIF after this
+                break
+            length = (data[pos + 2] << 8) | data[pos + 3]
+            if marker == 0xE1 and data[pos + 4:pos + 10] == b"Exif\x00\x00":
+                tiff = data[pos + 10:pos + 2 + length]
+                order = "little" if tiff[:2] == b"II" else "big" if tiff[:2] == b"MM" else None
+                if order is not None and int.from_bytes(tiff[2:4], order) == 42:
+                    ifd = int.from_bytes(tiff[4:8], order)
+                    count = int.from_bytes(tiff[ifd:ifd + 2], order)
+                    for k in range(count):
+                        entry = tiff[ifd + 2 + 12 * k:ifd + 14 + 12 * k]
+                        if len(entry) == 12 and int.from_bytes(entry[0:2], order) == 0x0112:
+                            value = int.from_bytes(entry[8:10], order)
+                            return value if 1 <= value <= 8 else 1
+            pos += 2 + length
+    except Exception:
+        pass
+    return 1
+
+
+def _apply_orientation(width, height, pic, o):
+    """Turn/flip a decoded picture (rows or flat bytes) so that EXIF orientation o looks upright.
+    Returns (width, height, picture) of the same kind it received."""
+    if o == 1:
+        return width, height, pic
+    new_w, new_h = (height, width) if o >= 5 else (width, height)
+    if isinstance(pic, list):
+        if o == 2:
+            rows = [r[::-1] for r in pic]
+        elif o == 3:
+            rows = [r[::-1] for r in pic[::-1]]
+        elif o == 4:
+            rows = pic[::-1]
+        elif o == 5:    # transpose
+            rows = [list(c) for c in zip(*pic)]
+        elif o == 6:    # 90 degrees clockwise
+            rows = [list(c) for c in zip(*pic[::-1])]
+        elif o == 7:    # transverse
+            rows = [list(c) for c in zip(*pic[::-1])][::-1]
+        else:           # 8: 90 degrees counterclockwise
+            rows = [list(c) for c in zip(*pic)][::-1]
+        return new_w, new_h, rows
+    lib = _native()
+    data, ptr = _out_buffer(width * height * 3)
+    if lib is None or lib.orient_rgb(_as_flat(pic), width, height, o, ptr):
+        raise ValueError("Could not apply the EXIF orientation.")
+    return new_w, new_h, bytes(data)
+
+
 def _decode_image(data, background=(0, 0, 0), box=None, flat=False):
     """Decode PNG, JPEG or GIF bytes (detected from the first bytes, not from the name).
     For an animated GIF this returns the first frame. flat=True: see _decode_png."""
@@ -1499,7 +1561,10 @@ def _decode_image(data, background=(0, 0, 0), box=None, flat=False):
         return _decode_png(data, background, flat)
     if data[:2] == b"\xff\xd8":
         try:
-            return _decode_jpeg(data, box, flat)
+            o = _jpeg_orientation(data)
+            if o >= 5 and box:  # the picture will be turned a quarter: swap the target box
+                box = (box[1], box[0])
+            return _apply_orientation(*_decode_jpeg(data, box, flat), o)
         except ValueError:
             raise
         except Exception as error:
