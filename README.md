@@ -184,7 +184,7 @@ python example.py path/to/your_image.png
 ## Limitations
 
 - PNG: all color types, 1-16 bit, tRNS and Adam7 interlacing are supported.
-- JPEG: baseline and progressive, grayscale and color, any chroma subsampling, restart markers. Not supported: arithmetic coding, 12-bit and CMYK/YCCK files. The EXIF orientation tag is ignored (a portrait photo from a phone may be drawn sideways).
+- JPEG: baseline and progressive, grayscale and color, any chroma subsampling, restart markers. Not supported: arithmetic coding, 12-bit and CMYK/YCCK files. The EXIF orientation tag (1-8) is applied, so photos taken with a phone are shown upright.
 - GIF: GIF87a and GIF89a, interlaced or not, local/global palettes, transparency, all disposal methods, animation and loop count. Transparent pixels are blended with `background` (black by default). Frame delays of 0 or 1 centisecond are played at 100 ms, like browsers do.
 - Other formats (WebP, BMP, APNG...) are not supported.
 - The `blocks` fallback needs a terminal with 24-bit color (set `IMGTERM_COLORS=256` otherwise).
